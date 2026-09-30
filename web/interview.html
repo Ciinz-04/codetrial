@@ -49,6 +49,14 @@
             <button id="pause" class="pill-button" type="button" hidden>
               Pause
             </button>
+            <button
+              id="yield-turn"
+              class="pill-button"
+              type="button"
+              title="Alt+Enter"
+            >
+              Your turn is done
+            </button>
             <button id="end" class="pill-button danger" type="button">
               End interview
             </button>
@@ -418,6 +426,23 @@
         ></span>
         <!-- Jim's subtitles belong under Jim's face, not across the room in the
              sidebar: the candidate is already looking here when he speaks. -->
+        <div class="turn-row">
+          <!-- Fills while the candidate is silent and resets when they speak,
+               so the moment Jim takes the turn is visible before it comes.
+               Clicking it hands the turn over now. -->
+          <button
+            id="turn-ring"
+            class="turn-ring"
+            type="button"
+            aria-label="Your turn is done"
+            title="Jim replies when this fills. Click to let him reply now."
+            hidden
+          ></button>
+          <p id="turn-status" class="muted small" role="status">
+            Take your time. Choose Your turn is done (Alt+Enter) to let Jim
+            reply early.
+          </p>
+        </div>
         <div
           id="captions-bar"
           class="captions-bar"

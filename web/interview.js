@@ -51,6 +51,10 @@ import {
   testPayload,
   timeWarningPayload,
   topics,
+  yieldTurnPayload,
+  isYieldShortcut,
+  turnCountdown,
+  turnWindowMs,
 } from "./lib.js";
 import {
   attachAvatarAnalyser,
@@ -255,6 +259,9 @@ const interviewProfile = {
 const interviewGrounding = consumeGroundingPacket(tabStorage);
 const state = {
   paused: false,
+  // Published by the agent; see `turnWindowMs`. Null draws no ring.
+  turnWindowMs: null,
+  agentSpeaking: false,
   codeByLanguage: { ...problem.starterCode },
   language: "python",
   // Thresholds already announced. A latch is released when the room pauses only
@@ -333,6 +340,9 @@ const nodes = {
 
   mic: document.querySelector("#mic"),
   pause: document.querySelector("#pause"),
+  yieldTurn: document.querySelector("#yield-turn"),
+  turnStatus: document.querySelector("#turn-status"),
+  turnRing: document.querySelector("#turn-ring"),
   end: document.querySelector("#end"),
   withdrawConsent: document.querySelector("#withdraw-consent"),
   recordingState: document.querySelector("#recording-state"),
@@ -520,6 +530,9 @@ function bindEvents() {
   // report rather than passing as thinking time.
   nodes.pause.hidden = false;
   nodes.pause.addEventListener("click", togglePause);
+  nodes.yieldTurn.addEventListener("click", yieldTurn);
+  nodes.turnRing.addEventListener("click", yieldTurn);
+  document.addEventListener("keydown", onTurnKey);
   nodes.end.addEventListener("click", () => endInterview("candidate_ended"));
   nodes.withdrawConsent.addEventListener("click", withdrawRecordingConsent);
   nodes.forceReport.addEventListener("click", showReport);
@@ -1260,6 +1273,7 @@ async function publishPreflightTracks(room, preflight) {
       source: source.Microphone,
     });
   }
+  startTurnRing(preflight.userStream);
   // A camera handed to Meet is already out of the stream, so this loop is
   // empty and LiveKit never holds the device open for the interview.
   for (const track of preflight.userStream?.getVideoTracks?.() || []) {
@@ -1478,11 +1492,14 @@ async function toggleMicrophone() {
       });
     }
   } else if (state.room) {
-    await state.room.localParticipant
+    const publication = await state.room.localParticipant
       .setMicrophoneEnabled(state.micEnabled)
       .catch(() => {
         state.micEnabled = !state.micEnabled;
       });
+    // LiveKit builds a fresh track here, which the ring's meter has never seen.
+    const track = publication?.track?.mediaStreamTrack;
+    if (state.micEnabled && track) startTurnRing(new MediaStream([track]));
   }
   nodes.mic.textContent = state.micEnabled ? "Mic on" : "Muted";
 }
@@ -1784,6 +1801,86 @@ function receiveControl(bytes) {
 /// cannot disagree about when coding is finished.
 function codingClosed() {
   return frameworkRound === "behavioral" || state.phase !== "live";
+}
+
+/// Neither control means anything without a live interviewer to hear it, and
+/// a paused interview is already holding the floor.
+function canTakeTurnAction() {
+  return state.connected && !state.paused && state.phase === "live";
+}
+
+function yieldTurn() {
+  if (!canTakeTurnAction()) return;
+  void publish(topics.control, yieldTurnPayload()).catch(() => {});
+}
+
+/// Only claims the key when it does something, so Alt+Enter is left alone
+/// outside a live interview.
+function onTurnKey(event) {
+  if (!isYieldShortcut(event, nodes.editor) || !canTakeTurnAction()) return;
+  event.preventDefault();
+  yieldTurn();
+}
+
+/// One microphone frame. Runs on every animation frame while the interview
+/// is live, so it writes the node only when what it shows changes.
+let turnSpokeAt = null;
+let turnRingProgress = null;
+function paintTurnRing(peak) {
+  const next = turnCountdown(turnSpokeAt, {
+    peak,
+    at: performance.now(),
+    silenceMs: state.turnWindowMs,
+    blocked: !canTakeTurnAction() || state.agentSpeaking || !state.micEnabled,
+  });
+  turnSpokeAt = next.spokeAt;
+  const hidden = next.progress === null;
+  if (nodes.turnRing.hidden !== hidden) nodes.turnRing.hidden = hidden;
+  const progress = hidden ? null : next.progress.toFixed(3);
+  if (progress !== null && progress !== turnRingProgress)
+    nodes.turnRing.style.setProperty("--turn-progress", progress);
+  turnRingProgress = progress;
+}
+
+function hideTurnRing() {
+  turnSpokeAt = null;
+  turnRingProgress = null;
+  nodes.turnRing.hidden = true;
+}
+
+/// Over the microphone track the room is sending, for as long as the
+/// interview is live. `createMicMeter` keeps it to one meter at a time, and a
+/// track that ends is forgotten, so the ring never counts silence on a
+/// microphone nobody is hearing. The same track again, as an unmute hands
+/// back, keeps the meter it has. A meter that fails leaves the controls
+/// working without the ring.
+let turnMeter = null;
+let turnMeterTrack = null;
+function stopTurnRing() {
+  turnMeter?.forget();
+  turnMeter = null;
+  turnMeterTrack = null;
+  hideTurnRing();
+}
+
+function startTurnRing(stream) {
+  const track = stream?.getAudioTracks?.()[0];
+  if (track && track === turnMeterTrack) return;
+  stopTurnRing();
+  if (!track || track.readyState === "ended") return;
+  const meter = createMicMeter({
+    pool: { stream, setError() {} },
+    isFinished: () => state.phase !== "live",
+    onLevel: paintTurnRing,
+    onFailure: hideTurnRing,
+    startMeter: startMediaMeter,
+  });
+  track.addEventListener?.("ended", () => {
+    if (turnMeter === meter) stopTurnRing();
+  });
+  turnMeter = meter;
+  turnMeterTrack = track;
+  meter.start();
 }
 
 function applyPause(paused) {
@@ -2532,6 +2629,8 @@ function updateAgentState() {
   // the mouth must not, because a missing attribute is not a claim of silence.
   const published = agent?.attributes?.["lk.agent.state"];
   const value = published || "listening";
+  state.agentSpeaking = value === "speaking";
+  state.turnWindowMs = turnWindowMs(agent?.attributes);
   const labels = {
     listening: "Listening",
     thinking: "Thinking...",

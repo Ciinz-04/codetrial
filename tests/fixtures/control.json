@@ -2,6 +2,12 @@
   "topic": "control",
   "cases": [
     {
+      "name": "yield turn",
+      "payload": {
+        "type": "yield_turn"
+      }
+    },
+    {
       "name": "time warning five minutes",
       "payload": {
         "type": "time_warning",

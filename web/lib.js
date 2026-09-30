@@ -604,8 +604,8 @@ const textEncoder = new TextEncoder();
 /// function-local, moving it left the whole suite green with the supported-card
 /// branch no longer rendering, which is the defect a local constant invites.
 export const ACTIVE_CONTRACT = {
-  bundleVersion: 21,
-  livePromptVersion: 13,
+  bundleVersion: 22,
+  livePromptVersion: 14,
   reportPromptVersion: 14,
   reportSchemaVersion: 2,
   rubricVersion: 1,
@@ -1684,4 +1684,74 @@ export function replayTimeline(events) {
     if (opening !== undefined) timeline.push({ window: opening });
   }
   return { moments, windows, timeline };
+}
+
+export function yieldTurnPayload() {
+  return { type: "yield_turn" };
+}
+
+/// The agent attribute carrying Gemini's silence window, in milliseconds;
+/// `TURN_WINDOW_ATTRIBUTE` in `src/livekit/session.rs` publishes it.
+export const TURN_WINDOW_ATTRIBUTE = "codetrial.silence_ms";
+
+/// A microphone peak at or above this is the candidate speaking. Well above
+/// `MIC_SILENT_PEAK`, which only proves a live device, so room noise does not
+/// hold the ring at empty.
+export const TURN_SPEECH_PEAK = 0.06;
+
+/// How long a full ring stays up waiting for Jim before it is taken down. Jim
+/// usually starts within a second of the window; after this the ring is only
+/// claiming a turn change nobody is making.
+export const TURN_RING_LINGER_MS = 2000;
+
+/// The window the agent published, or null when it published none. No
+/// fallback: a ring drawn against a guessed window would count down to a
+/// moment that is not coming.
+export function turnWindowMs(attributes) {
+  const value = Number(attributes?.[TURN_WINDOW_ATTRIBUTE]);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/// Where the candidate is in the silence Gemini waits through before taking
+/// the turn. `progress` runs from 0, still talking, to 1, Jim is due; null is
+/// nothing to count down. `spokeAt` is the state to pass back next frame.
+///
+/// Measured from this page's microphone, not from Gemini's own detector, so it
+/// is an estimate of the moment rather than the moment itself. Speech resets it
+/// and anything that means Jim is not waiting on the candidate clears it.
+export function turnCountdown(spokeAt, { peak, at, silenceMs, blocked }) {
+  if (blocked || !silenceMs) return { spokeAt: null, progress: null };
+  if (peak >= TURN_SPEECH_PEAK) return { spokeAt: at, progress: 0 };
+  if (spokeAt === null) return { spokeAt: null, progress: null };
+  const elapsed = at - spokeAt;
+  if (elapsed > silenceMs + TURN_RING_LINGER_MS)
+    return { spokeAt: null, progress: null };
+  return { spokeAt, progress: Math.min(1, elapsed / silenceMs) };
+}
+
+/// Alt+Enter hands the turn over from anywhere on the page except a text
+/// field that is not the code editor, where the key belongs to the field. The
+/// editor is included on purpose: it is where the candidate is while they talk
+/// through their code, and it binds nothing to Alt+Enter.
+export function isYieldShortcut(event, editor) {
+  if (
+    !event.altKey ||
+    event.key !== "Enter" ||
+    event.repeat ||
+    event.isComposing ||
+    event.defaultPrevented ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey
+  )
+    return false;
+  const target = event.target;
+  if (target === editor) return true;
+  const tag = target?.tagName;
+  return !(
+    tag === "INPUT" ||
+    tag === "TEXTAREA" ||
+    tag === "SELECT" ||
+    target?.isContentEditable
+  );
 }

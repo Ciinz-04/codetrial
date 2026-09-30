@@ -514,6 +514,40 @@ p {
   display: block;
 }
 
+/* The turn countdown sits beside the line that explains it. The ring is a
+   conic fill masked to a band, driven by `--turn-progress` from 0 to 1. */
+.turn-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+}
+
+.turn-row p {
+  margin: 0;
+}
+
+.turn-ring {
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  pointer-events: auto;
+  background: conic-gradient(
+    var(--accent) calc(var(--turn-progress, 0) * 1turn),
+    var(--hairline) 0
+  );
+  -webkit-mask: radial-gradient(circle, transparent 55%, #000 56%);
+  mask: radial-gradient(circle, transparent 55%, #000 56%);
+}
+
+.turn-ring[hidden] {
+  display: none;
+}
+
 .hide-avatar {
   pointer-events: auto;
   margin-top: 0.35rem;

@@ -1906,6 +1906,10 @@ fn realtime_messages_match_live_websocket_shapes() {
         realtime_video_message(&[3, 4], "image/jpeg")["realtimeInput"]["video"],
         json!({"data":"AwQ=","mimeType":"image/jpeg"})
     );
+    assert_eq!(
+        realtime_audio_end_message(),
+        json!({"realtimeInput":{"audioStreamEnd":true}})
+    );
 }
 
 #[test]

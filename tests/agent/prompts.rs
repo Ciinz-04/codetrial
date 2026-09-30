@@ -53,8 +53,8 @@ fn prompt_golden_digest_matches_versions() {
     // its hash is a string nothing checks. The pair is still asserted, because
     // the failure worth catching is a version bumped with the golden left
     // alone, which a digest comparison on its own reads as fine.
-    let recorded_versions = (13, 14);
-    let recorded_digest = "aaedd160db3d4fa2bbb27a43732b300cb800bdabca387495c8cce8f517fa0d97";
+    let recorded_versions = (14, 14);
+    let recorded_digest = "1acea2f506ba6d712ef3b7d92a7186c7378a5c0cb973bdc87779f8bf7251aa81";
 
     assert_eq!(
         (LIVE_PROMPT_VERSION, REPORT_PROMPT_VERSION),
@@ -1085,16 +1085,16 @@ fn interview_contract_versions_are_one_closed_bundle() {
         "the bundle table has no row for {INTERVIEW_CONTRACT_BUNDLE_VERSION}"
     );
 
-    assert_eq!(INTERVIEW_CONTRACT_BUNDLE_VERSION, 21);
-    assert_eq!(LIVE_PROMPT_VERSION, 13);
+    assert_eq!(INTERVIEW_CONTRACT_BUNDLE_VERSION, 22);
+    assert_eq!(LIVE_PROMPT_VERSION, 14);
     assert_eq!(REPORT_PROMPT_VERSION, 14);
     assert_eq!(RUBRIC_VERSION, 1);
     assert_eq!(REPORT_SCHEMA_VERSION, 2);
     assert_eq!(
         interview_contract_json(),
         json!({
-            "bundleVersion": 21,
-            "livePromptVersion": 13,
+            "bundleVersion": 22,
+            "livePromptVersion": 14,
             "reportPromptVersion": 14,
             "rubricVersion": 1,
             "reportSchemaVersion": 2,

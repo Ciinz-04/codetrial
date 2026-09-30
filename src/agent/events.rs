@@ -563,6 +563,10 @@ fn apply_control(
     receipt_timestamp_ms: u64,
 ) -> DataEventResult {
     match payload.get("type").and_then(serde_json::Value::as_str) {
+        Some("yield_turn") if !state.ended && !state.paused => DataEventResult {
+            yield_turn: true,
+            ..DataEventResult::default()
+        },
         Some("pause_interview") if !state.ended => {
             control_pause(state, payload, receipt_timestamp_ms)
         }

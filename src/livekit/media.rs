@@ -260,7 +260,7 @@ impl AudioSink for GeminiLiveSession {
     }
 }
 
-async fn flush_audio<S: AudioSink>(
+pub(super) async fn flush_audio<S: AudioSink>(
     gemini: &mut S,
     bytes: &mut Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

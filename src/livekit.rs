@@ -884,7 +884,7 @@ async fn open_session<'a>(
     let agent_identity = agent_identity(room_name);
     let (room, mut events) = join_room(config, room_name, &agent_identity, now_seconds).await?;
     let mut agent_state = String::new();
-    set_agent_state(&room, &mut agent_state, AGENT_STATE_LISTENING).await?;
+    session::publish_opening_attributes(&room, &mut agent_state, config.gemini_silence_ms).await?;
 
     // The candidate's metadata picks the problem, so nothing else can start
     // until someone joins.
@@ -1418,12 +1418,12 @@ pub async fn run_room(
         let step = tokio::select! {
             () = &mut hard_deadline, if !turn.state.ended => {
                 let mut context =
-                    turn.context(&mut output_audio, &mut gemini, media.identity.as_deref());
+                    turn.context(&mut output_audio, &mut gemini, &mut media);
                 on_hard_deadline(&room, &mut context, &mut loops, interview).await?
             }
             _ = watch.tick(), if !turn.state.ended => {
                 let mut context =
-                    turn.context(&mut output_audio, &mut gemini, media.identity.as_deref());
+                    turn.context(&mut output_audio, &mut gemini, &mut media);
                 on_watch_tick(&room, &mut context, &mut loops, interview).await?
             }
             event = events.recv() => {
@@ -1454,7 +1454,7 @@ pub async fn run_room(
                         let mut context = turn.context(
                             &mut output_audio,
                             &mut gemini,
-                            media.identity.as_deref(),
+                            &mut media,
                         );
                         handle_room_event(
                             &room,
@@ -1474,12 +1474,12 @@ pub async fn run_room(
             }
             event = gemini.next_event() => {
                 let mut context =
-                    turn.context(&mut output_audio, &mut gemini, media.identity.as_deref());
+                    turn.context(&mut output_audio, &mut gemini, &mut media);
                 on_gemini_event(&room, &mut context, event, &mut loops, interview).await?
             }
             _ = tokio::time::sleep_until(output_audio.playout_deadline.into()), if turn.activity.floor == Floor::AwaitingPlayout && output_audio.is_playing() => {
                 let mut context =
-                    turn.context(&mut output_audio, &mut gemini, media.identity.as_deref());
+                    turn.context(&mut output_audio, &mut gemini, &mut media);
                 on_playout_settled(&room, &mut context, &mut loops, interview).await?
             }
             frame = next_audio_frame(&mut media.audio), if media.audio.is_some() => {
@@ -1863,6 +1863,18 @@ fn ready_to_close(state: &RuntimeState, activity: &RuntimeActivity) -> bool {
     state.end_requested && !state.ended && !state.paused && !activity.tool_response_outstanding
 }
 
+/// The candidate handed the turn over. Buffered audio goes first, then the
+/// stream ends, so Gemini answers without waiting out its silence window: in a
+/// measured session the reply's first audio came about 0.8s after the last
+/// word rather than 3.4s.
+async fn yield_candidate_turn(
+    gemini: &mut GeminiLiveSession,
+    candidate_audio: &mut Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    flush_audio(gemini, candidate_audio).await?;
+    gemini.end_audio_turn().await
+}
+
 /// Ends the interview by handing the loop the packet the browser would send.
 ///
 /// Three routes reach the same ending now -- the candidate's own button, the
@@ -1939,6 +1951,13 @@ async fn handle_data_packet(
     }
     if result.update_last_interjection {
         context.activity.last_interjection = Instant::now();
+    }
+    if result.yield_turn
+        && let Err(error) = yield_candidate_turn(context.gemini, context.candidate_audio).await
+    {
+        eprintln!(
+            "Gemini turn finalization failed ({error}); waiting for the close to be reported"
+        );
     }
     if let Some(paused) = result.pause_changed {
         room.local_participant()

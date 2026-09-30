@@ -16,18 +16,15 @@ pub const DEFAULT_GEMINI_LIVE_MODEL: &str = "gemini-3.1-flash-live-preview";
 /// think needs a longer window than someone who does not, and cutting it too
 /// short interrupts people while they are still talking.
 ///
-/// The default is sized for the speaker this is actually pointed at, who is
-/// composing an answer in a second language. 700ms was measured against a
-/// fluent speaker and is inside the pause such a candidate takes to find the
-/// next word: Gemini called the turn over, Jim answered, and the candidate was
-/// still mid-sentence. The cost of the other mistake is that every reply
-/// starts later, which nobody reports as a broken interview, but every reply
-/// pays: at 1,500ms the window was about seven tenths of what the candidate
-/// waited between finishing and hearing the reply start. 1,000ms keeps most of
-/// the room the second-language pause needed and gives half a second back on
-/// every turn. A room that still sees candidates cut off sets
-/// `GEMINI_SILENCE_MS` higher.
-pub const DEFAULT_GEMINI_SILENCE_MS: u32 = 1_000;
+/// Three seconds leaves room for a mid-sentence pause. The candidate can yield
+/// early through the browser control, which ends the audio stream instead of
+/// making every reply wait through that window: in a measured session the
+/// reply's first audio came about 0.8s after the last word rather than 3.4s,
+/// and in one turn of twelve the end was ignored and the window ran as usual.
+/// The page draws the window filling, so the wait is visible rather than a
+/// surprise. Rooms can still tune `GEMINI_SILENCE_MS` for their speakers and
+/// hardware.
+pub const DEFAULT_GEMINI_SILENCE_MS: u32 = 3_000;
 
 /// How readily Gemini decides the candidate has started speaking, and so how
 /// readily it abandons a reply it is part way through delivering.

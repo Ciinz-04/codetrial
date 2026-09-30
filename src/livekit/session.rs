@@ -30,7 +30,7 @@ use crate::runtime::{
     TOPIC_CONTROL, TOPIC_TRANSCRIPTION,
 };
 
-use super::media::OutputAudio;
+use super::media::{CandidateMedia, OutputAudio};
 use super::turn::{Floor, Interruptible, RuntimeActivity, SpeakerTurns, TurnState, closing_order};
 use super::{
     AGENT_STATE_LISTENING, AGENT_STATE_SPEAKING, LIVEKIT_AGENT_STATE, NOTABLE_PLAYOUT_BACKLOG,
@@ -81,6 +81,7 @@ pub(super) struct GeminiEventContext<'a> {
     pub(super) activity: &'a mut RuntimeActivity,
     turns: &'a mut SpeakerTurns,
     candidate_identity: Option<&'a str>,
+    pub(super) candidate_audio: &'a mut Vec<u8>,
 }
 
 /// What to do with an inbound Gemini event before its own arm sees it.
@@ -588,6 +589,38 @@ pub(super) async fn set_agent_state(
     Ok(())
 }
 
+/// How long Gemini waits through the candidate's silence before taking the
+/// turn, so the page can draw the countdown to it. An attribute rather than a
+/// message: it is fixed for the interview, and a page that joins or reloads
+/// after the agent reads it without asking. `TURN_WINDOW_ATTRIBUTE` in
+/// `web/lib.js` names the same key.
+pub(super) const TURN_WINDOW_ATTRIBUTE: &str = "codetrial.silence_ms";
+
+/// The agent's first attributes, listening and the turn window, in the one
+/// round trip the room pays before it waits for the candidate.
+pub(super) async fn publish_opening_attributes(
+    room: &Room,
+    current: &mut String,
+    silence_ms: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let participant = room.local_participant();
+    let attributes = agent_state_attributes(participant.attributes(), AGENT_STATE_LISTENING);
+    participant
+        .set_attributes(turn_window_attributes(attributes, silence_ms))
+        .await?;
+    current.clear();
+    current.push_str(AGENT_STATE_LISTENING);
+    Ok(())
+}
+
+fn turn_window_attributes(
+    mut attributes: HashMap<String, String>,
+    silence_ms: u32,
+) -> HashMap<String, String> {
+    attributes.insert(TURN_WINDOW_ATTRIBUTE.to_string(), silence_ms.to_string());
+    attributes
+}
+
 fn agent_state_attributes(
     mut attributes: HashMap<String, String>,
     state: &str,
@@ -1062,7 +1095,7 @@ impl TurnState {
         &'a mut self,
         output_audio: &'a mut OutputAudio,
         gemini: &'a mut GeminiLiveSession,
-        candidate_identity: Option<&'a str>,
+        media: &'a mut CandidateMedia,
     ) -> GeminiEventContext<'a> {
         GeminiEventContext {
             output_audio,
@@ -1071,7 +1104,8 @@ impl TurnState {
             agent_state: &mut self.agent_state,
             activity: &mut self.activity,
             turns: &mut self.turns,
-            candidate_identity,
+            candidate_identity: media.identity.as_deref(),
+            candidate_audio: &mut media.audio_bytes,
         }
     }
 }
