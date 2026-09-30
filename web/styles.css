@@ -865,6 +865,10 @@ p {
   overflow: hidden;
 }
 
+#editor-highlight code {
+     font: inherit;
+   }
+
 #editor-lines {
   position: absolute;
   inset: 0 auto 0 0;
