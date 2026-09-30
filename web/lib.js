@@ -1523,20 +1523,23 @@ export function responseWindows(events) {
   /// row is the end of a question or something else. `null` until the first one,
   /// so a replay that opens on a `listening` starts no window.
   let previous = null;
-  /// Whether the interview is paused right now, from the `lifecycle` rows.
-  /// Carried across the whole scan rather than read per window, because the
-  /// `paused` row and the `listening` row a pause causes are written by two
-  /// different sides and either can land first.
+  /// Whether the interview is paused, or held for thinking time, right now,
+  /// from the `lifecycle` rows. Carried across the whole scan rather than read
+  /// per window, because the `paused` row and the `listening` row a pause
+  /// causes are written by two different sides and either can land first.
   let paused = false;
+  let thinking = false;
   for (const [index, event] of replayRows(events).entries()) {
     if (event?.kind === "lifecycle") {
       const state = event.payload?.state;
       if (state === "paused" || state === "resumed")
         paused = state === "paused";
+      if (state === "thinking_started" || state === "thinking_ended")
+        thinking = state === "thinking_started";
       // A window already open when the break started keeps the mark, which is
       // the ordinary case: the candidate pauses during their own turn and no
       // `avatar` row is written at all.
-      if (paused && open) open.paused = true;
+      if ((paused || thinking) && open) open.paused = true;
       // The interview is over. `send_wrap_up_and_wait` in `src/livekit.rs` ends
       // by setting `listening` again, and the browser keeps recording past
       // `ended` to write `rounds_final`, so without this every timed-out
@@ -1573,14 +1576,18 @@ export function responseWindows(events) {
     const before = previous;
     previous = state;
 
-    // The interviewer speaking is proof the interview is not paused, which is
-    // what bounds a lost `resumed` row to the windows before it. `watch_prompt`
-    // in `src/livekit/turn.rs` returns nothing while `state.paused`, and
-    // `handle_gemini_event` in `src/livekit.rs` drops every audio event then, so
-    // there is no path from a paused interview to a `speaking` row. Without this
-    // one dropped batch painted every remaining window as paused, and that mark
-    // is the panel's only affirmative claim.
-    if (state === "speaking") paused = false;
+    // Speech proves the interview is neither paused nor holding for thinking
+    // time, bounding a lost `resumed` or `thinking_ended` row to the windows
+    // before it. `watch_prompt` in `src/livekit/turn.rs` returns nothing while
+    // the floor is held, and `handle_gemini_event` in `src/livekit/session.rs`
+    // drops every audio event then, so there is no path from a paused or held
+    // interview to a `speaking` row. Without this one dropped batch painted
+    // every remaining window as paused, and that mark is the panel's only
+    // affirmative claim.
+    if (state === "speaking") {
+      paused = false;
+      thinking = false;
+    }
 
     // Closed first. A `speaking` row both ends the window before it and, on the
     // next `listening`, opens the one after; taking them in the other order
@@ -1608,7 +1615,7 @@ export function responseWindows(events) {
         at: event.at,
         duration: null,
         turn: null,
-        paused,
+        paused: paused || thinking,
         matched,
       };
       windows.push(open);
@@ -1684,6 +1691,10 @@ export function replayTimeline(events) {
     if (opening !== undefined) timeline.push({ window: opening });
   }
   return { moments, windows, timeline };
+}
+
+export function thinkingPayload(thinking) {
+  return { type: "thinking", thinking: Boolean(thinking) };
 }
 
 export function yieldTurnPayload() {

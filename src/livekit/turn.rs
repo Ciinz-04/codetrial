@@ -66,6 +66,19 @@ pub(super) const CODE_SETTLE: Duration = Duration::from_secs(10);
 /// itself, from an older checkpoint than an orderly replacement resumes.
 pub(super) const PROMPT_STALL: Duration = Duration::from_secs(20);
 
+/// How long after Thinking is chosen a transcript is still taken as the tail
+/// of what came before it. With the audio stream ended at the click, Gemini
+/// delivered that transcript about 0.3s later in a measured session.
+pub(super) const THINKING_TRANSCRIPT_GRACE: Duration = Duration::from_millis(1_500);
+
+/// The window for a room whose silence window is `silence_ms`: never as long
+/// as half of it, so the transcript of speech begun after the click, which
+/// Gemini sends only once that silence window has passed behind it, always
+/// lands outside.
+pub(super) fn thinking_transcript_grace(silence_ms: u32) -> Duration {
+    THINKING_TRANSCRIPT_GRACE.min(Duration::from_millis(u64::from(silence_ms) / 2))
+}
+
 pub(super) struct RuntimeActivity {
     pub(super) last_code_change: Instant,
     pub(super) last_user_speech: Instant,
@@ -130,6 +143,12 @@ pub(super) struct RuntimeActivity {
     /// A pause can arrive between Gemini producing a reply and this loop
     /// receiving its final event. Drop that old turn after resume too.
     pub(super) discarding_output: bool,
+    /// Transcription from before Thinking was chosen, arriving after it, is
+    /// not the candidate speaking again; see `ignore_input_before_hold`.
+    pub(super) thinking_ignore_input_until: Option<Instant>,
+    /// A reply the candidate is owed was dropped with a discarded turn when a
+    /// provisional hold ended; see `defer_thinking_reply`.
+    pub(super) reply_after_thinking_discard: bool,
     /// When a pause was last read into. Sized against `INTERIM_COOLDOWN`.
     pub(super) last_interim: Instant,
     /// The quota is fixed when the interview starts. A later config reload
@@ -226,6 +245,8 @@ impl RuntimeActivity {
             unsent_watch: None,
             floor: Floor::Listening,
             discarding_output: false,
+            thinking_ignore_input_until: None,
+            reply_after_thinking_discard: false,
             tool_response_outstanding: false,
             behavioral_nudged: false,
             live_usage: crate::gemini::TokenUsage::default(),
@@ -340,7 +361,10 @@ impl RuntimeActivity {
     /// candidate finished and heard nothing back, a prompt got no output, or
     /// a tool response still needs its continuation.
     pub(super) fn owes_reply(&self) -> bool {
-        self.reply_in_flight() || self.owes_prompt() || self.tool_response_outstanding
+        self.reply_in_flight()
+            || self.owes_prompt()
+            || self.tool_response_outstanding
+            || self.reply_after_thinking_discard
     }
 
     /// Hands the floor back when a prompt has gone `PROMPT_STALL` without any
@@ -427,6 +451,150 @@ impl RuntimeActivity {
         }
     }
 
+    /// One fragment of the candidate's current utterance, against the hold.
+    /// A provisional request can reverse as more of the same utterance
+    /// arrives; the state methods decide what is recorded and told.
+    pub(super) fn observe_thinking_fragment(
+        &mut self,
+        state: &mut RuntimeState,
+        text: &str,
+        at: Instant,
+        receipt: u64,
+    ) {
+        if state.ended || state.paused || self.predates_hold(at) {
+            return;
+        }
+        let Some(next) = crate::agent::thinking_change(state.thinking_hold, text) else {
+            return;
+        };
+        if next {
+            state.request_thinking();
+            return;
+        }
+        if !state.withdraw_thinking_request() {
+            state.end_thinking(receipt);
+        }
+
+        // Prompting here would answer before the candidate has finished this
+        // utterance. But Gemini may already be answering it, and the hold has
+        // been dropping that answer: its discard runs to the turn's end, so
+        // nothing of it would be heard. The reply is asked for once it ends.
+        self.reply_after_thinking_discard |= self.discarding_output;
+    }
+
+    /// Thinking was chosen at `at`. Gemini transcribes an utterance when it
+    /// decides the utterance is over, and in a measured session sent the whole
+    /// transcript in one message at that point, so what the candidate said just
+    /// before the click arrives after it and must not read as them speaking
+    /// again. The click also ends the audio stream, which brought that
+    /// transcript about 0.3s later. The Live API documents an
+    /// `inputTranscription.finished` that would mark the utterance's end, but
+    /// did not send it in a measured session, so the window's own end is it.
+    ///
+    /// Not extended by what arrives inside it. Speech that starts after the
+    /// click is transcribed only once Gemini's silence window has run out
+    /// behind it, so its transcript cannot land inside a `window` shorter than
+    /// that one; see `thinking_transcript_grace`. Extending on arrival is what
+    /// let an answer given straight after the click be swallowed.
+    pub(super) fn ignore_input_before_hold(&mut self, at: Instant, window: Duration) {
+        self.thinking_ignore_input_until = Some(at + window);
+    }
+
+    /// Monotonic, unlike the epoch receipt: a wall-clock step inside the
+    /// window would otherwise end it early or stretch it.
+    fn predates_hold(&self, at: Instant) -> bool {
+        self.thinking_ignore_input_until
+            .is_some_and(|until| at < until)
+    }
+
+    /// The utterance behind a provisional request has ended, so the request
+    /// stands: declare it.
+    pub(super) fn confirm_thinking_request(
+        &mut self,
+        state: &mut RuntimeState,
+        now: Instant,
+        receipt: u64,
+    ) {
+        if !state.thinking_hold.is_requested() || state.ended {
+            return;
+        }
+        self.declared_request(state, now, receipt);
+    }
+
+    /// `settle_stale_request`, for the watch tick: a request its turn's end
+    /// never confirmed is confirmed here instead.
+    pub(super) fn settle_stale_request(
+        &mut self,
+        state: &mut RuntimeState,
+        now: Instant,
+        receipt: u64,
+    ) {
+        if state.settle_stale_request(now, receipt) {
+            self.reply_after_thinking_discard = false;
+        }
+    }
+
+    /// A confirmed request replaces debt caused only by a tentative hold.
+    fn declared_request(&mut self, state: &mut RuntimeState, now: Instant, receipt: u64) {
+        self.reply_after_thinking_discard = false;
+        state.declare_thinking(now, receipt);
+    }
+
+    /// What a control packet did to a provisional request, read off the
+    /// reducer's result rather than the packet. A Thinking click that declared
+    /// it supersedes the reply debt its tentative discard left; a yield or an
+    /// ending that abandoned it owes a reply its discard dropped, once that
+    /// discard's turn ends.
+    pub(super) fn settle_thinking_request(
+        &mut self,
+        was_requested: bool,
+        state: &RuntimeState,
+        result: &crate::agent::DataEventResult,
+    ) {
+        if !was_requested {
+            return;
+        }
+        if state.thinking_hold.is_declared() {
+            self.reply_after_thinking_discard = false;
+        } else if result.yield_turn || result.finish_interview.is_some() {
+            self.reply_after_thinking_discard |= self.discarding_output;
+        }
+    }
+
+    /// Continuing ended a provisional hold while its discard was still
+    /// dropping the reply Gemini started for the request. The candidate is
+    /// owed that reply, so it is asked for once the discarded turn ends; see
+    /// `claim_thinking_reply`.
+    pub(super) fn defer_thinking_reply(&mut self, prompt: &str) {
+        if self.discarding_output {
+            self.reply_after_thinking_discard = true;
+            self.owe_prompt(Instant::now(), Some(prompt.to_string()));
+        }
+    }
+
+    pub(super) fn thinking_reply_prompt(&self) -> String {
+        crate::agent::owed_reply(self.prompt_text.as_deref().filter(|_| self.owes_prompt()))
+    }
+
+    /// The dropped turn has ended. One the candidate cut off by speaking owes
+    /// no reply of its own: that speech gets Gemini's native answer, and asking
+    /// again would talk over them.
+    pub(super) fn end_discard(&mut self, interrupted: bool) {
+        self.discarding_output = false;
+        if interrupted {
+            self.reply_after_thinking_discard = false;
+        }
+    }
+
+    /// The reply `defer_thinking_reply` held back is due: its discard has
+    /// ended and nothing has put the floor back on hold. Taken once.
+    pub(super) fn claim_thinking_reply(&mut self, state: &RuntimeState) -> bool {
+        if self.discarding_output || state.floor_held() || state.ended {
+            return false;
+        }
+        std::mem::take(&mut self.reply_after_thinking_discard)
+    }
+
     /// Whether this pause is worth spending an idle-window review on.
     ///
     /// Every condition here is "nothing is happening": nobody holds the floor,
@@ -493,7 +661,7 @@ impl RuntimeActivity {
 
         // The behavioral round has no reviews, so once its one nudge is spent
         // there is nothing left to watch for.
-        if state.paused || (behavioral && self.behavioral_nudged) {
+        if state.floor_held() || (behavioral && self.behavioral_nudged) {
             return None;
         }
         let decision = timing_decision(&TimingInput {

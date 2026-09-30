@@ -4,6 +4,7 @@
 //! test and not an integration test: private items are in scope.
 
 use super::*;
+use crate::agent::ThinkingHold;
 use ::livekit::webrtc::audio_source::AudioSourceOptions;
 use ::livekit::webrtc::audio_source::native::NativeAudioSource;
 use tokio::sync::mpsc;
@@ -2042,15 +2043,19 @@ async fn replacement_sockets_receive_local_progress_before_continuing() {
     }
     use Replacement::{Cold, Resumed};
 
+    /// The resume, sent: the room loop pays the debt it carries once the
+    /// send succeeds.
     fn unpause(state: &mut RuntimeState) -> String {
-        crate::agent::apply_data_event(
+        let resumed = crate::agent::apply_data_event(
             state,
             crate::runtime::TOPIC_CONTROL,
             &serde_json::json!({"type": "pause_interview", "paused": false}),
             0.0,
-        )
-        .generate_reply
-        .unwrap()
+        );
+        if resumed.carries_thinking_debt {
+            state.clear_thinking_debt();
+        }
+        resumed.generate_reply.unwrap()
     }
 
     let mut tool_activity = RuntimeActivity::new(Instant::now());
@@ -2426,6 +2431,21 @@ async fn fake_resumed_socket() -> (
     GeminiLiveSession,
     tokio::task::JoinHandle<serde_json::Value>,
 ) {
+    let (gemini, server) = fake_recording_socket(1).await;
+    (
+        gemini,
+        tokio::spawn(async move { server.await.unwrap().remove(0) }),
+    )
+}
+
+/// `fake_resumed_socket` for a sequence: hands back the first `count`
+/// messages the client sends after setup, in order.
+async fn fake_recording_socket(
+    count: usize,
+) -> (
+    GeminiLiveSession,
+    tokio::task::JoinHandle<Vec<serde_json::Value>>,
+) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -2448,8 +2468,20 @@ async fn fake_resumed_socket() -> (
             .send(Message::Text(r#"{"setupComplete":{}}"#.into()))
             .await
             .unwrap();
-        let message = socket.next().await.unwrap().unwrap();
-        serde_json::from_str(message.to_text().unwrap()).unwrap()
+
+        // Bounded, so a write that never happens fails the test instead of
+        // hanging it: under mutation testing a hang is a timeout, which is
+        // neither caught nor missed.
+        let mut messages = Vec::with_capacity(count);
+        while messages.len() < count {
+            let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("the client never sent the message the test waits for")
+                .unwrap()
+                .unwrap();
+            messages.push(serde_json::from_str(message.to_text().unwrap()).unwrap());
+        }
+        messages
     });
     let gemini = crate::gemini::live_session_with_keys_at(
         &url,
@@ -2843,6 +2875,50 @@ fn a_refused_ending_after_test_does_not_invite_another_run() {
     assert!(!refusal.contains("click Run"));
 }
 
+#[test]
+fn a_replacement_abandons_an_unconfirmed_thinking_hold() {
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Requested {
+            since: std::time::Instant::now(),
+        },
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(Instant::now());
+    clear_abandoned_socket_work(&mut state, &mut activity);
+    assert_eq!(state.thinking_hold, ThinkingHold::Off);
+}
+
+#[tokio::test]
+async fn a_resumed_socket_waits_through_thinking_and_retains_its_reply() {
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(Instant::now());
+    let (mut gemini, server) = fake_resumed_socket().await;
+    assert!(
+        !brief_replacement(
+            &mut gemini,
+            &mut state,
+            &mut activity,
+            Replacement::Resumed { owed: true },
+            Some("the outstanding question")
+        )
+        .await
+    );
+    assert!(
+        state
+            .owed_reply_on_resume
+            .as_ref()
+            .unwrap()
+            .contains("the outstanding question")
+    );
+    let sent = server.await.unwrap();
+    assert_eq!(sent["clientContent"]["turnComplete"], false);
+}
+
 #[tokio::test]
 async fn yielding_sends_the_native_audio_stream_finalization_signal() {
     let (mut gemini, server) = fake_resumed_socket().await;
@@ -2854,10 +2930,489 @@ async fn yielding_sends_the_native_audio_stream_finalization_signal() {
 }
 
 #[tokio::test]
-async fn a_yield_sends_buffered_speech_before_it_ends_the_stream() {
+async fn a_socket_replacement_answers_an_unconfirmed_request_instead_of_stranding_it() {
+    let start = Instant::now();
+    let mut state = RuntimeState::default();
+    let mut activity = RuntimeActivity::new(start);
+    activity.note_candidate_finished(start);
+    activity.observe_thinking_fragment(&mut state, "Let me think", Instant::now(), 100);
+    let (mut output_audio, _frames) = test_output_audio();
+    let (owed, _, _) = hand_over(&mut state, &mut activity, &mut output_audio);
+    assert!(owed);
+    assert!(!state.thinking_hold.is_active());
     let (mut gemini, server) = fake_resumed_socket().await;
-    let mut audio = vec![0; 640];
-    yield_candidate_turn(&mut gemini, &mut audio).await.unwrap();
-    assert!(audio.is_empty());
-    assert!(server.await.unwrap()["realtimeInput"]["audio"].is_object());
+    assert!(
+        brief_replacement(
+            &mut gemini,
+            &mut state,
+            &mut activity,
+            Replacement::Cold,
+            None
+        )
+        .await
+    );
+    let sent = server.await.unwrap();
+    assert!(
+        sent["realtimeInput"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("[SYSTEM EVENT]"))
+    );
+    assert_eq!(activity.floor, Floor::Speaking);
+
+    state.thinking_hold = ThinkingHold::Held {
+        since: std::time::Instant::now(),
+    };
+    clear_abandoned_socket_work(&mut state, &mut activity);
+    assert!(
+        state.thinking_hold.is_active(),
+        "a confirmed hold survives replacement"
+    );
+}
+
+#[test]
+fn a_thinking_hold_cancels_a_model_requested_close_after_its_audio_was_cut() {
+    let mut state = RuntimeState {
+        end_requested: true,
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(Instant::now());
+    activity.tool_response_outstanding = true;
+    crate::agent::apply_data_event(
+        &mut state,
+        crate::runtime::TOPIC_CONTROL,
+        &serde_json::json!({"type":"thinking","thinking":true}),
+        0.0,
+    );
+    let (mut output_audio, _frames) = test_output_audio();
+    cut_off_turn(&mut activity, &mut output_audio);
+    assert!(!activity.tool_response_outstanding);
+    assert!(!ready_to_close(&state, &activity));
+    crate::agent::apply_data_event(
+        &mut state,
+        crate::runtime::TOPIC_CONTROL,
+        &serde_json::json!({"type":"thinking","thinking":false}),
+        0.0,
+    );
+    assert!(!state.thinking_hold.is_active());
+    assert!(!state.end_requested);
+    assert!(!ready_to_close(&state, &activity));
+    state.end_requested = true;
+    assert!(ready_to_close(&state, &activity));
+}
+
+#[test]
+fn a_spoken_hold_cancels_the_old_close_before_the_candidate_resumes() {
+    let mut state = RuntimeState {
+        end_requested: true,
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(Instant::now());
+    activity.observe_thinking_fragment(&mut state, "Wait, let me think", Instant::now(), 100);
+    assert!(!state.end_requested);
+    activity.confirm_thinking_request(&mut state, Instant::now(), 101);
+    assert_eq!(state.take_thinking_notice(), Some(true));
+    activity.observe_thinking_fragment(
+        &mut state,
+        "Actually, the complexity is",
+        Instant::now(),
+        102,
+    );
+    assert_eq!(state.take_thinking_notice(), Some(false));
+    assert!(!ready_to_close(&state, &activity));
+}
+
+#[tokio::test]
+async fn choosing_thinking_ends_the_audio_stream_and_ignores_the_transcript_it_releases() {
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        ..RuntimeState::default()
+    };
+    let click = Instant::now();
+    let mut activity = RuntimeActivity::new(click);
+    let (mut gemini, server) = fake_resumed_socket().await;
+    let mut audio = Vec::new();
+    begin_button_hold(
+        &mut gemini,
+        &mut audio,
+        &mut activity,
+        click,
+        THINKING_TRANSCRIPT_GRACE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        server.await.unwrap(),
+        crate::gemini::realtime_audio_end_message()
+    );
+    activity.observe_thinking_fragment(
+        &mut state,
+        "I would use a hash map",
+        click + Duration::from_millis(300),
+        1_300,
+    );
+    assert_eq!(state.take_thinking_notice(), None);
+    assert!(state.thinking_hold.is_active());
+}
+
+/// `settle_hold` against `turn`, clicked now, at the default grace.
+async fn settle(
+    turn: &mut TurnState,
+    output_audio: &mut OutputAudio,
+    gemini: &mut GeminiLiveSession,
+    media: &mut CandidateMedia,
+    result: &crate::agent::DataEventResult,
+    reply: &mut Option<String>,
+) -> HoldEffects {
+    let mut context = turn.context(output_audio, gemini, media);
+    settle_hold(
+        &mut context,
+        result,
+        reply,
+        Instant::now(),
+        THINKING_TRANSCRIPT_GRACE,
+    )
+    .await
+}
+
+/// A `TurnState` for `settle_hold`, which reads the room loop's whole context.
+fn hold_turn(state: RuntimeState) -> TurnState {
+    TurnState {
+        state,
+        agent_state: String::new(),
+        activity: RuntimeActivity::new(Instant::now()),
+        turns: SpeakerTurns::default(),
+    }
+}
+
+#[tokio::test]
+async fn yielding_flushes_buffered_speech_then_ends_the_stream() {
+    let mut turn = hold_turn(RuntimeState::default());
+    let (mut output_audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_recording_socket(2).await;
+    let mut media = CandidateMedia::new();
+    media.audio_bytes = vec![0; 640];
+    let result = crate::agent::DataEventResult {
+        yield_turn: true,
+        ..Default::default()
+    };
+    let mut reply = None;
+    let effects = settle(
+        &mut turn,
+        &mut output_audio,
+        &mut gemini,
+        &mut media,
+        &result,
+        &mut reply,
+    )
+    .await;
+    assert_eq!(effects, HoldEffects::default());
+    assert!(media.audio_bytes.is_empty());
+    let sent = server.await.unwrap();
+    assert!(sent[0]["realtimeInput"]["audio"].is_object(), "{sent:?}");
+    assert_eq!(sent[1], crate::gemini::realtime_audio_end_message());
+}
+
+#[tokio::test]
+async fn repeated_thinking_acknowledges_without_finalizing_resumed_speech() {
+    let mut turn = hold_turn(RuntimeState::default());
+    let click = Instant::now();
+    let payload = serde_json::json!({"type":"thinking","thinking":true});
+    let first = crate::agent::apply_data_event(
+        &mut turn.state,
+        crate::runtime::TOPIC_CONTROL,
+        &payload,
+        0.0,
+    );
+    assert_eq!(first.thinking_changed, Some(true));
+    assert_eq!(turn.state.take_thinking_notice(), Some(true));
+    turn.activity
+        .ignore_input_before_hold(click, THINKING_TRANSCRIPT_GRACE);
+    let original_window = turn.activity.thinking_ignore_input_until;
+    let original_hold = turn.state.thinking_hold;
+    let duplicate_at = click + THINKING_TRANSCRIPT_GRACE + Duration::from_millis(100);
+    let (mut output_audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_recording_socket(1).await;
+    let mut media = CandidateMedia::new();
+    media.audio_bytes = vec![0; 640];
+    let result = crate::agent::apply_data_event(
+        &mut turn.state,
+        crate::runtime::TOPIC_CONTROL,
+        &payload,
+        0.0,
+    );
+    assert_eq!(result.thinking_changed, None);
+    assert_eq!(turn.state.take_thinking_notice(), Some(true));
+    assert_eq!(turn.state.thinking_hold, original_hold);
+    let mut reply = result.generate_reply.clone();
+    let effects = {
+        let mut context = turn.context(&mut output_audio, &mut gemini, &mut media);
+        settle_hold(
+            &mut context,
+            &result,
+            &mut reply,
+            duplicate_at,
+            THINKING_TRANSCRIPT_GRACE,
+        )
+        .await
+    };
+    assert_eq!(effects, HoldEffects::default());
+    assert_eq!(media.audio_bytes.len(), 640);
+    assert_eq!(turn.activity.thinking_ignore_input_until, original_window);
+    turn.activity.observe_thinking_fragment(
+        &mut turn.state,
+        "I would use a hash map",
+        duplicate_at + Duration::from_millis(300),
+        2_000,
+    );
+    assert!(!turn.state.thinking_hold.is_active());
+    assert_eq!(turn.state.take_thinking_notice(), Some(false));
+    assert_eq!(turn.state.evidence_ledger.lifecycle.transitions, 2);
+    let repeated_release = crate::agent::apply_data_event(
+        &mut turn.state,
+        crate::runtime::TOPIC_CONTROL,
+        &serde_json::json!({"type":"thinking","thinking":false}),
+        0.0,
+    );
+    assert_eq!(repeated_release.thinking_changed, None);
+    assert_eq!(turn.state.take_thinking_notice(), Some(false));
+    gemini.end_audio_turn().await.unwrap();
+    assert_eq!(
+        server.await.unwrap(),
+        vec![crate::gemini::realtime_audio_end_message()]
+    );
+}
+
+#[tokio::test]
+async fn choosing_thinking_while_jim_talks_cuts_him_off_and_says_why() {
+    let mut turn = hold_turn(RuntimeState {
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        ..RuntimeState::default()
+    });
+    turn.activity.mark_speaking();
+    let (mut output_audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_recording_socket(2).await;
+    let mut media = CandidateMedia::new();
+    let result = crate::agent::DataEventResult {
+        thinking_changed: Some(true),
+        ..Default::default()
+    };
+    let mut reply = None;
+    let effects = settle(
+        &mut turn,
+        &mut output_audio,
+        &mut gemini,
+        &mut media,
+        &result,
+        &mut reply,
+    )
+    .await;
+    assert_eq!(
+        effects,
+        HoldEffects {
+            cut_off: true,
+            abandoned: false
+        }
+    );
+    assert_eq!(turn.activity.floor, Floor::Listening);
+    let sent = server.await.unwrap();
+    assert_eq!(sent[0], crate::gemini::realtime_audio_end_message());
+    assert!(
+        sent[1].to_string().contains("has kept the floor"),
+        "{sent:?}"
+    );
+    assert_eq!(sent[1]["clientContent"]["turnComplete"], false);
+}
+
+#[tokio::test]
+async fn releasing_into_an_open_candidate_turn_delivers_the_prompt_as_context() {
+    let mut turn = hold_turn(RuntimeState {
+        needs_cold_brief: true,
+        ..RuntimeState::default()
+    });
+    turn.turns.candidate.record(
+        &mut turn.state.transcript,
+        crate::agent::CANDIDATE_SPEAKER,
+        "so I would sort first",
+    );
+    let (mut output_audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_recording_socket(2).await;
+    let mut media = CandidateMedia::new();
+    let result = crate::agent::DataEventResult {
+        thinking_changed: Some(false),
+        carries_thinking_debt: true,
+        ..Default::default()
+    };
+    let mut reply = Some("[SYSTEM EVENT] The candidate is ready.".to_string());
+    let effects = settle(
+        &mut turn,
+        &mut output_audio,
+        &mut gemini,
+        &mut media,
+        &result,
+        &mut reply,
+    )
+    .await;
+    assert_eq!(effects, HoldEffects::default());
+    assert!(reply.is_none(), "delivered as context, not asked for again");
+    assert!(!turn.state.needs_cold_brief, "the debt it carried is paid");
+    let sent = server.await.unwrap();
+    assert_eq!(sent[0]["clientContent"]["turnComplete"], false);
+    assert!(sent[0].to_string().contains("The candidate is ready."));
+    assert_eq!(sent[1], crate::gemini::realtime_audio_end_message());
+}
+
+#[tokio::test]
+async fn a_cold_replacement_during_a_pause_waits_to_brief_and_keeps_the_reply_it_owed() {
+    let mut state = RuntimeState {
+        paused: true,
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(Instant::now());
+    let (mut gemini, _server) = fake_recording_socket(0).await;
+    assert!(
+        !brief_replacement(
+            &mut gemini,
+            &mut state,
+            &mut activity,
+            Replacement::Cold,
+            Some("the outstanding question"),
+        )
+        .await
+    );
+    assert!(state.needs_cold_brief);
+    assert!(
+        state
+            .owed_reply_on_resume
+            .as_deref()
+            .is_some_and(|owed| owed.contains("the outstanding question"))
+    );
+}
+
+#[tokio::test]
+async fn a_cold_replacement_during_a_hold_is_briefed_at_once_without_a_reply() {
+    let mut state = RuntimeState {
+        // A pause's own cold replacement left its briefing owed; this one
+        // delivers it, so the hold's release must not deliver it again.
+        needs_cold_brief: true,
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        code: "return 42".into(),
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(Instant::now());
+    let (mut gemini, server) = fake_resumed_socket().await;
+    assert!(
+        !brief_replacement(
+            &mut gemini,
+            &mut state,
+            &mut activity,
+            Replacement::Cold,
+            Some("the outstanding question"),
+        )
+        .await
+    );
+    let sent = server.await.unwrap();
+    assert_eq!(sent["clientContent"]["turnComplete"], false);
+    assert!(sent.to_string().contains("return 42"), "{sent}");
+    assert!(!state.needs_cold_brief, "already briefed");
+    assert_eq!(state.code_shown, state.code);
+    assert!(
+        state
+            .owed_reply_on_resume
+            .as_deref()
+            .is_some_and(|owed| owed.contains("the outstanding question"))
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_reply_carries_the_unheard_note_it_pays() {
+    let mut state = RuntimeState {
+        thinking_unheard_reply: true,
+        ..RuntimeState::default()
+    };
+    let mut activity = RuntimeActivity::new(Instant::now());
+    let (mut gemini, server) = fake_resumed_socket().await;
+    assert!(
+        brief_replacement(
+            &mut gemini,
+            &mut state,
+            &mut activity,
+            Replacement::Resumed { owed: true },
+            Some("the outstanding question"),
+        )
+        .await
+    );
+    assert!(!state.thinking_unheard_reply);
+    let sent = server.await.unwrap();
+    assert!(
+        sent.to_string()
+            .contains("Nothing you said while the candidate was thinking"),
+        "{sent}"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_reply_leaves_the_audio_stream_alone() {
+    let mut turn = hold_turn(RuntimeState::default());
+    let (mut output_audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_recording_socket(1).await;
+    let mut media = CandidateMedia::new();
+    media.audio_bytes = vec![0; 640];
+    let result = crate::agent::DataEventResult::default();
+    let mut reply = Some("[SYSTEM EVENT] The tests passed.".to_string());
+    let effects = settle(
+        &mut turn,
+        &mut output_audio,
+        &mut gemini,
+        &mut media,
+        &result,
+        &mut reply,
+    )
+    .await;
+    assert_eq!(effects, HoldEffects::default());
+    assert_eq!(reply.as_deref(), Some("[SYSTEM EVENT] The tests passed."));
+    assert_eq!(
+        media.audio_bytes.len(),
+        640,
+        "buffered speech is not flushed"
+    );
+
+    // Nothing went out ahead of this, so it is the first thing the socket sees.
+    gemini.send_context("marker", false).await.unwrap();
+    let sent = server.await.unwrap();
+    assert!(sent[0].to_string().contains("marker"), "{sent:?}");
+}
+
+#[tokio::test]
+async fn releasing_with_no_candidate_turn_open_leaves_the_reply_to_be_asked_for() {
+    let mut turn = hold_turn(RuntimeState::default());
+    let (mut output_audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_recording_socket(2).await;
+    let mut media = CandidateMedia::new();
+    let result = crate::agent::DataEventResult {
+        thinking_changed: Some(false),
+        carries_thinking_debt: true,
+        ..Default::default()
+    };
+    let mut reply = Some("[SYSTEM EVENT] The candidate is ready.".to_string());
+    let effects = settle(
+        &mut turn,
+        &mut output_audio,
+        &mut gemini,
+        &mut media,
+        &result,
+        &mut reply,
+    )
+    .await;
+    assert_eq!(effects, HoldEffects::default());
+    assert!(reply.is_some(), "a realtime prompt, sent after this");
+    gemini.send_context("marker", false).await.unwrap();
+    let sent = server.await.unwrap();
+    assert_eq!(sent[0], crate::gemini::realtime_audio_end_message());
+    assert!(sent[1].to_string().contains("marker"), "{sent:?}");
 }

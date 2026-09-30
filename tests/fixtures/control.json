@@ -2,6 +2,20 @@
   "topic": "control",
   "cases": [
     {
+      "name": "thinking start",
+      "payload": {
+        "type": "thinking",
+        "thinking": true
+      }
+    },
+    {
+      "name": "thinking end",
+      "payload": {
+        "type": "thinking",
+        "thinking": false
+      }
+    },
+    {
       "name": "yield turn",
       "payload": {
         "type": "yield_turn"

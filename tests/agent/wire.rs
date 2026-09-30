@@ -945,3 +945,311 @@ fn cited_source_ids_are_bounded_the_way_the_browser_bounds_them() {
         "web/lib.js must keep the same four-citation and twelve-character bounds"
     );
 }
+
+#[test]
+fn browser_thinking_controls_keep_evidence_live_and_yield_the_floor() {
+    let (topic, cases) = wire_fixture(include_str!("../fixtures/control.json"));
+    let mut state = RuntimeState::default();
+    let started = state.started_at;
+    let start = wire_case(&cases, "thinking start");
+    let result = apply_data_event(&mut state, &topic, start, TEST_REACTION_COOLDOWN_S);
+    assert_eq!(result.thinking_changed, Some(true));
+    assert!(state.thinking_hold.is_active());
+    assert!(!state.paused);
+    assert!(result.generate_reply.is_none());
+    assert_eq!(state.started_at, started);
+    assert_eq!(
+        apply_data_event(&mut state, &topic, start, 0.0).thinking_changed,
+        None
+    );
+
+    let code = apply_data_event(
+        &mut state,
+        "code_update",
+        &json!({"code":"return 42", "language":"python"}),
+        0.0,
+    );
+    assert_eq!(state.code, "return 42");
+    assert!(code.generate_reply.is_none());
+    let run = apply_data_event(
+        &mut state,
+        "test_results",
+        &json!({"language":"python","passed":1,"total":1,"code":"return 42","failures":[]}),
+        TEST_REACTION_COOLDOWN_S,
+    );
+    assert_eq!(state.test_runs, 1);
+    assert!(run.generate_reply.is_none());
+
+    let yielded = apply_data_event(&mut state, &topic, wire_case(&cases, "yield turn"), 0.0);
+    assert!(yielded.yield_turn);
+    assert_eq!(yielded.thinking_changed, Some(false));
+    assert!(!state.thinking_hold.is_active());
+    assert!(yielded.generate_reply.is_some());
+    assert_eq!(state.started_at, started);
+    let ordinary_yield = apply_data_event(&mut state, &topic, wire_case(&cases, "yield turn"), 0.0);
+    assert!(ordinary_yield.yield_turn);
+    assert!(ordinary_yield.generate_reply.is_none());
+
+    apply_data_event(&mut state, &topic, start, 0.0);
+    let continued = apply_data_event(&mut state, &topic, wire_case(&cases, "thinking end"), 0.0);
+    assert_eq!(continued.thinking_changed, Some(false));
+    assert!(continued.generate_reply.is_some());
+    state.paused = true;
+    assert!(!apply_data_event(&mut state, &topic, wire_case(&cases, "yield turn"), 0.0).yield_turn);
+    state.paused = false;
+    state.ended = true;
+    assert_eq!(
+        apply_data_event(&mut state, &topic, start, 0.0).thinking_changed,
+        None
+    );
+}
+
+#[test]
+fn thinking_preserves_recovery_debt_across_pause_and_resume() {
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        needs_cold_brief: true,
+        owed_reply_on_resume: Some("Answer the outstanding candidate question".into()),
+        code: "return 42".into(),
+        ..RuntimeState::default()
+    };
+    control(&mut state, json!({"type":"pause_interview","paused":true}));
+    let resume = control(&mut state, json!({"type":"pause_interview","paused":false}));
+    assert!(resume.generate_reply.is_none());
+    assert!(state.needs_cold_brief);
+    assert!(state.owed_reply_on_resume.is_some());
+    let ready = control(&mut state, json!({"type":"thinking","thinking":false}));
+    let prompt = ready.generate_reply.unwrap();
+    assert!(prompt.contains("return 42"));
+    assert!(prompt.contains("Answer the outstanding candidate question"));
+    assert!(state.needs_cold_brief, "a failed send must retain the debt");
+}
+
+#[test]
+fn the_five_minute_warning_ends_a_hold_and_the_goodbye_ends_another() {
+    let mut state = near_time_up(RuntimeState {
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        thinking_unheard_reply: true,
+        ..RuntimeState::default()
+    });
+    let warning = control(&mut state, json!({"type":"time_warning"}));
+    assert_eq!(warning.thinking_changed, Some(false));
+    assert!(!state.thinking_hold.is_active());
+    let prompt = warning.generate_reply.unwrap();
+    assert!(prompt.contains("five-minute"));
+    assert!(prompt.contains("Nothing you said while the candidate was thinking"));
+    assert_eq!(state.evidence_ledger.lifecycle.transitions, 1);
+    control(&mut state, json!({"type":"thinking","thinking":true}));
+    let ended = control(
+        &mut state,
+        json!({"type":"end_interview","reason":"time_expired"}),
+    );
+    assert_eq!(ended.thinking_changed, Some(false));
+    assert!(!state.thinking_hold.is_active());
+    assert_eq!(ended.finish_interview.as_deref(), Some("time_expired"));
+}
+
+#[test]
+fn a_round_transition_ends_a_hold() {
+    let mut state = with_written_code(RuntimeState::default());
+    past_the_coding_gate(&mut state);
+    state.thinking_hold = ThinkingHold::Held {
+        since: std::time::Instant::now(),
+    };
+    let transition = control(
+        &mut state,
+        json!({"type":"round_transition","round":"behavioral"}),
+    );
+    assert_eq!(transition.round_changed, Some("started"));
+    assert_eq!(transition.thinking_changed, Some(false));
+    assert!(!state.thinking_hold.is_active());
+    assert!(state.behavioral_round_started);
+    assert!(transition.generate_reply.unwrap().contains("behavioral"));
+}
+
+#[test]
+fn a_continue_right_after_the_last_one_releases_without_a_reply() {
+    let mut state = RuntimeState::default();
+    toggle_thinking(&mut state, true);
+    let first = toggle_thinking(&mut state, false);
+    assert!(first.generate_reply.is_some());
+    assert!(first.carries_thinking_debt);
+    toggle_thinking(&mut state, true);
+    let second = toggle_thinking(&mut state, false);
+    assert_eq!(second.thinking_changed, Some(false));
+    assert!(!state.thinking_hold.is_active());
+    assert!(second.generate_reply.is_none(), "one reply per cooldown");
+
+    // What a hold left owed is still delivered inside the cooldown.
+    toggle_thinking(&mut state, true);
+    state.thinking_unheard_reply = true;
+    let owed = toggle_thinking(&mut state, false);
+    assert!(
+        owed.generate_reply
+            .unwrap()
+            .contains("Nothing you said while the candidate was thinking")
+    );
+
+    // And the cooldown ends.
+    state.thinking_released_at = Some(std::time::Instant::now() - THINKING_RELEASE_COOLDOWN);
+    toggle_thinking(&mut state, true);
+    assert!(toggle_thinking(&mut state, false).generate_reply.is_some());
+}
+
+#[test]
+fn a_cold_briefing_on_resume_also_asks_for_the_reply_owed() {
+    let mut state = RuntimeState {
+        paused: true,
+        needs_cold_brief: true,
+        owed_reply_on_resume: Some("Answer the outstanding candidate question.".into()),
+        code: "return 42".into(),
+        ..RuntimeState::default()
+    };
+    let resumed = control(&mut state, json!({"type":"pause_interview","paused":false}));
+    let prompt = resumed.generate_reply.unwrap();
+    assert!(prompt.contains("return 42"));
+    assert!(prompt.contains("Answer the outstanding candidate question."));
+
+    // Kept until the room loop has sent it: a resume that fails to send leaves
+    // it for the next socket.
+    assert!(resumed.carries_thinking_debt);
+    assert!(state.needs_cold_brief);
+    assert!(state.owed_reply_on_resume.is_some());
+}
+
+#[test]
+fn asking_for_the_state_it_already_has_re_announces_it() {
+    let mut state = RuntimeState::default();
+    toggle_thinking(&mut state, true);
+    assert_eq!(state.thinking_notice.take(), Some(true));
+    toggle_thinking(&mut state, true);
+    assert_eq!(
+        state.thinking_notice.take(),
+        Some(true),
+        "a lost acknowledgement is corrected by asking again"
+    );
+    assert_eq!(state.evidence_ledger.lifecycle.transitions, 1);
+    toggle_thinking(&mut state, false);
+    toggle_thinking(&mut state, false);
+    assert_eq!(state.thinking_notice.take(), Some(false));
+    assert_eq!(state.evidence_ledger.lifecycle.transitions, 2);
+}
+
+#[test]
+fn a_test_run_during_a_hold_is_told_to_the_model_without_asking_for_a_reply() {
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        language: "python".into(),
+        code: "def f():\n    return 1".into(),
+        ..RuntimeState::default()
+    };
+    let result = apply_data_event(
+        &mut state,
+        "test_results",
+        &json!({"language":"python","passed":2,"total":2,"setupError":0.0,"failures":[]}),
+        TEST_REACTION_COOLDOWN_S,
+    );
+    assert!(result.generate_reply.is_none(), "the hold keeps Jim quiet");
+    assert!(
+        result.update_last_test_reaction,
+        "delivered, so the reaction cooldown starts"
+    );
+    assert!(!result.update_last_interjection);
+    assert!(
+        result
+            .held_context
+            .as_deref()
+            .is_some_and(|text| text.contains("every one passed")),
+        "{:?}",
+        result.held_context
+    );
+    assert_eq!(
+        state.code_shown, state.code,
+        "and the model sees what it was told"
+    );
+}
+
+#[test]
+fn a_pause_withdraws_a_request_it_would_otherwise_leave_undecided() {
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Requested {
+            since: std::time::Instant::now(),
+        },
+        ..RuntimeState::default()
+    };
+    for paused in [true, false] {
+        let result = control(
+            &mut state,
+            json!({"type":"pause_interview","paused":paused}),
+        );
+        if !paused {
+            assert!(result.generate_reply.is_some(), "the resume line is spoken");
+        }
+    }
+    assert_eq!(state.thinking_hold, ThinkingHold::Off);
+    assert_eq!(state.thinking_notice, None, "nothing public happened");
+
+    // A declared hold is the candidate's, and survives a pause.
+    state.thinking_hold = ThinkingHold::Held {
+        since: std::time::Instant::now(),
+    };
+    for paused in [true, false] {
+        control(
+            &mut state,
+            json!({"type":"pause_interview","paused":paused}),
+        );
+    }
+    assert!(state.thinking_hold.is_declared());
+}
+
+#[test]
+fn a_yield_carries_the_debt_it_delivers_and_a_pause_carries_none() {
+    let mut state = RuntimeState {
+        thinking_unheard_reply: true,
+        ..RuntimeState::default()
+    };
+    let yielded = control(&mut state, json!({"type":"yield_turn"}));
+    assert!(yielded.yield_turn);
+    assert!(yielded.carries_thinking_debt);
+    assert!(
+        yielded
+            .generate_reply
+            .unwrap()
+            .contains("Nothing you said while the candidate was thinking")
+    );
+
+    // Pausing says nothing, so it pays nothing, however much is owed.
+    let paused = control(&mut state, json!({"type":"pause_interview","paused":true}));
+    assert!(paused.generate_reply.is_none());
+    assert!(!paused.carries_thinking_debt);
+    assert!(state.thinking_unheard_reply);
+}
+
+#[test]
+fn only_a_held_test_reaction_starts_the_reaction_cooldown() {
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        code: "old".into(),
+        language: "python".into(),
+        ..RuntimeState::default()
+    };
+    let switched = apply_data_event(
+        &mut state,
+        "code_update",
+        &json!({"code": "old", "language": "javascript"}),
+        TEST_REACTION_COOLDOWN_S,
+    );
+    assert!(switched.held_context.is_some(), "{switched:?}");
+    assert!(
+        !switched.update_last_test_reaction,
+        "a held language confirmation is not a test reaction"
+    );
+}

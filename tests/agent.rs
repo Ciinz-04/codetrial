@@ -638,6 +638,16 @@ fn run_tests(state: &mut RuntimeState, passed: i64, total: i64) -> DataEventResu
     apply_data_event(state, TOPIC_TEST_RESULTS, &packet, 100.0)
 }
 
+/// Applies one control packet, as the page sends it.
+fn control(state: &mut RuntimeState, payload: Value) -> DataEventResult {
+    apply_data_event(state, TOPIC_CONTROL, &payload, 0.0)
+}
+
+/// The Thinking button, pressed (`true`) or released with Continue.
+fn toggle_thinking(state: &mut RuntimeState, thinking: bool) -> DataEventResult {
+    control(state, json!({"type":"thinking","thinking":thinking}))
+}
+
 fn evaluation_reaction(case: &Value, state: &mut RuntimeState) -> String {
     let reaction = &case["reaction"];
     let code = reaction["code"].as_str().expect("reaction code is text");

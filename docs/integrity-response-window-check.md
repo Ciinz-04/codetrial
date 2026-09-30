@@ -153,3 +153,10 @@ answer.
 | 2. Closing turn rendered or dropped? | | |
 | 3. Consecutive empty windows worth marking (a number) | | |
 | 4. Pause mark enough, or its own entry? | | |
+
+Explicit thinking time is a declared conversation hold. Its `thinking_started`
+and `thinking_ended` lifecycle rows mark an overlapping response window the
+same way a declared pause does; the panel names both possibilities. Neither
+requests a candidate judgment or changes the deadline. A subsequent interviewer
+speaking row bounds a missing end row, since the runtime suppresses speech
+while the hold is active.

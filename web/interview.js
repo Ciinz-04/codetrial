@@ -51,6 +51,7 @@ import {
   testPayload,
   timeWarningPayload,
   topics,
+  thinkingPayload,
   yieldTurnPayload,
   isYieldShortcut,
   turnCountdown,
@@ -259,6 +260,7 @@ const interviewProfile = {
 const interviewGrounding = consumeGroundingPacket(tabStorage);
 const state = {
   paused: false,
+  candidateThinking: false,
   // Published by the agent; see `turnWindowMs`. Null draws no ring.
   turnWindowMs: null,
   agentSpeaking: false,
@@ -340,6 +342,7 @@ const nodes = {
 
   mic: document.querySelector("#mic"),
   pause: document.querySelector("#pause"),
+  thinking: document.querySelector("#thinking"),
   yieldTurn: document.querySelector("#yield-turn"),
   turnStatus: document.querySelector("#turn-status"),
   turnRing: document.querySelector("#turn-ring"),
@@ -530,6 +533,7 @@ function bindEvents() {
   // report rather than passing as thinking time.
   nodes.pause.hidden = false;
   nodes.pause.addEventListener("click", togglePause);
+  nodes.thinking.addEventListener("click", toggleThinking);
   nodes.yieldTurn.addEventListener("click", yieldTurn);
   nodes.turnRing.addEventListener("click", yieldTurn);
   document.addEventListener("keydown", onTurnKey);
@@ -1748,7 +1752,15 @@ function showFrameworkHint() {
 function receiveControl(bytes) {
   try {
     const message = JSON.parse(new TextDecoder().decode(bytes));
-    if (message.type === "pause_state" && typeof message.paused === "boolean") {
+    if (
+      message.type === "thinking_state" &&
+      typeof message.thinking === "boolean"
+    ) {
+      applyThinking(message.thinking);
+    } else if (
+      message.type === "pause_state" &&
+      typeof message.paused === "boolean"
+    ) {
       applyPause(message.paused);
     } else if (
       message.type === "interviewer_state" &&
@@ -1809,6 +1821,15 @@ function canTakeTurnAction() {
   return state.connected && !state.paused && state.phase === "live";
 }
 
+/// The state flips when the agent answers with `thinking_state`, not here, so
+/// a double click asks twice for one change rather than toggling it back.
+function toggleThinking() {
+  if (!canTakeTurnAction()) return;
+  void publish(topics.control, thinkingPayload(!state.candidateThinking)).catch(
+    () => {},
+  );
+}
+
 function yieldTurn() {
   if (!canTakeTurnAction()) return;
   void publish(topics.control, yieldTurnPayload()).catch(() => {});
@@ -1831,7 +1852,11 @@ function paintTurnRing(peak) {
     peak,
     at: performance.now(),
     silenceMs: state.turnWindowMs,
-    blocked: !canTakeTurnAction() || state.agentSpeaking || !state.micEnabled,
+    blocked:
+      !canTakeTurnAction() ||
+      state.candidateThinking ||
+      state.agentSpeaking ||
+      !state.micEnabled,
   });
   turnSpokeAt = next.spokeAt;
   const hidden = next.progress === null;
@@ -1881,6 +1906,19 @@ function startTurnRing(stream) {
   turnMeter = meter;
   turnMeterTrack = track;
   meter.start();
+}
+
+function applyThinking(thinking) {
+  if (thinking === state.candidateThinking) return;
+  state.candidateThinking = thinking;
+  nodes.thinking.textContent = thinking ? "Continue" : "Thinking";
+  nodes.thinking.setAttribute("aria-pressed", String(thinking));
+  nodes.turnStatus.textContent = thinking
+    ? "Jim will wait. Speak again or choose Continue when ready. The timer keeps running."
+    : "Take your time. Choose Your turn is done (Alt+Enter) to let Jim reply early.";
+  recordReplay("lifecycle", {
+    state: thinking ? "thinking_started" : "thinking_ended",
+  });
 }
 
 function applyPause(paused) {

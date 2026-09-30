@@ -5,13 +5,18 @@
 //! rather than a fact: everything here is written by the candidate's browser,
 //! so each applier decides what it is willing to believe before it stores it.
 
+use std::time::Instant;
+
+use super::turn_taking::{
+    owed_context, thinking_owes_context, thinking_resume, with_thinking_debt,
+};
 use super::{
     DataEventResult, INTERVIEWER_SPEAKER, InterviewLoop, LanguageChoiceContext,
     LifecycleTransition, MAX_INTEGRITY_EVENTS, ROUND_TRANSITION_SKEW, RuntimeState, SincePrevious,
     TIME_WARNING_S, TestRecord, TestSource, analyze_code, analyze_code_cached,
-    behavioral_time_warning, changed_excerpt, cold_restart, format_test_run_for_reaction,
-    integrity_hash, language_choice, observe_code, observe_code_cached, python_truthy, resume,
-    round_skipped, round_started, sanitize_integrity_event, sanitize_test_run, spoken_language,
+    behavioral_time_warning, changed_excerpt, format_test_run_for_reaction, integrity_hash,
+    language_choice, observe_code, observe_code_cached, python_truthy, resume, round_skipped,
+    round_started, sanitize_integrity_event, sanitize_test_run, spoken_language,
     test_reaction_decision, test_results_reaction, test_runner_unavailable_reaction,
     test_setup_error_reaction, time_warning,
 };
@@ -109,6 +114,32 @@ fn apply_data_event_at_with_received(
         TOPIC_INTEGRITY => apply_integrity(state, payload),
         _ => DataEventResult::default(),
     };
+
+    if state.thinking_hold.is_active() && result.finish_interview.is_none() {
+        match result.generate_reply.take() {
+            Some(prompt) if result.preempts_hold => {
+                let declared = state.end_thinking(receipt_timestamp_ms);
+                result.thinking_changed = declared.then_some(false);
+                result.generate_reply = Some(with_thinking_debt(state, &prompt));
+                result.carries_thinking_debt = true;
+            }
+
+            // The hold silences the interviewer, not what it knows. A test run
+            // or an edit it would have reacted to is still news, and the
+            // reaction already moved `code_shown` past the edit it describes,
+            // so dropping it left later reviews diffing from code the model
+            // never saw.
+            //
+            // A reaction delivered this way was still delivered, so it starts
+            // the reaction cooldown: without that, every Run during a hold sent
+            // the model another summary it was told not to answer.
+            held => {
+                result.update_last_test_reaction &= held.is_some();
+                result.update_last_interjection = false;
+                result.held_context = held;
+            }
+        }
+    }
 
     // Stamped here rather than in each arm, because the reading is the same
     // fact for all of them and an arm added later would otherwise be the one
@@ -563,10 +594,49 @@ fn apply_control(
     receipt_timestamp_ms: u64,
 ) -> DataEventResult {
     match payload.get("type").and_then(serde_json::Value::as_str) {
-        Some("yield_turn") if !state.ended && !state.paused => DataEventResult {
-            yield_turn: true,
-            ..DataEventResult::default()
-        },
+        Some("thinking") if !state.ended && !state.paused => {
+            let Some(thinking) = payload.get("thinking").and_then(serde_json::Value::as_bool)
+            else {
+                return DataEventResult::default();
+            };
+
+            // Answered with the state either way, so a page whose last
+            // acknowledgement was lost is corrected by asking again.
+            let now = Instant::now();
+            if thinking {
+                let declared = state.declare_thinking(now, receipt_timestamp_ms);
+                state.announce_thinking();
+                return DataEventResult {
+                    thinking_changed: declared.then_some(true),
+                    ..DataEventResult::default()
+                };
+            }
+            if !state.thinking_hold.is_active() {
+                state.announce_thinking();
+                return DataEventResult::default();
+            }
+            state.end_thinking(receipt_timestamp_ms);
+            let recent = state.released_recently(now);
+            state.thinking_released_at = Some(now);
+            let reply = !recent || thinking_owes_context(state);
+            DataEventResult {
+                thinking_changed: Some(false),
+                generate_reply: reply.then(|| thinking_resume(state)),
+                carries_thinking_debt: reply,
+                ..DataEventResult::default()
+            }
+        }
+        Some("yield_turn") if !state.ended && !state.paused => {
+            let declared = state.end_thinking(receipt_timestamp_ms);
+            let reply = declared || thinking_owes_context(state);
+            DataEventResult {
+                yield_turn: true,
+                thinking_changed: declared.then_some(false),
+                generate_reply: reply.then(|| thinking_resume(state)),
+                carries_thinking_debt: reply,
+                ..DataEventResult::default()
+            }
+        }
         Some("pause_interview") if !state.ended => {
             control_pause(state, payload, receipt_timestamp_ms)
         }
@@ -580,7 +650,10 @@ fn apply_control(
                 && state.started_at.elapsed() + ROUND_TRANSITION_SKEW
                     >= std::time::Duration::from_secs(u64::from(state.coding_minutes) * 60) =>
         {
-            control_round_transition(state, receipt_timestamp_ms)
+            DataEventResult {
+                preempts_hold: true,
+                ..control_round_transition(state, receipt_timestamp_ms)
+            }
         }
         Some("time_warning")
             if !state.ended
@@ -588,7 +661,10 @@ fn apply_control(
                 && !state.time_warning_seen
                 && time_warning_is_due(state) =>
         {
-            control_time_warning(state)
+            DataEventResult {
+                preempts_hold: true,
+                ..control_time_warning(state)
+            }
         }
         Some("end_interview") if !state.ended => {
             control_end_interview(state, payload, receipt_timestamp_ms)
@@ -625,28 +701,42 @@ fn control_pause(
         },
     );
 
+    // A provisional request cannot be confirmed across a pause: its utterance's
+    // end is dropped with the rest of the paused output. Left in place, it
+    // silenced the resume line and, its settle clock having run through the
+    // pause, was declared on the first tick after it.
+    if paused {
+        state.withdraw_thinking_request();
+    } else {
+        state.restart_thinking_clock(Instant::now());
+    }
+
     // A resumed interview whose interviewer was replaced mid-pause has to be
     // re-grounded before it is told to carry on: the fixed line below assumes a
     // Jim who remembers the conversation, and after a cold restart there is
     // none to continue from.
-    let cold_brief = !paused && std::mem::take(&mut state.needs_cold_brief);
-    let owed_reply = if paused {
-        None
-    } else {
-        state.owed_reply_on_resume.take()
-    };
+    let can_reply = !state.floor_held();
     DataEventResult {
         pause_changed: Some(paused),
-        generate_reply: (!paused).then(|| {
-            if cold_brief {
-                state.code_shown = state.code.clone();
-                cold_restart(state)
-            } else if let Some(owed_reply) = owed_reply {
-                format!("{} {owed_reply}", resume(state.behavioral_round_started))
+        generate_reply: can_reply.then(|| {
+            if state.needs_cold_brief {
+                // The briefing, then anything else the replaced socket left
+                // owed, which the briefing alone does not ask for.
+                owed_context(state)
             } else {
-                resume(state.behavioral_round_started)
+                let resumed = resume(state.behavioral_round_started);
+                let owed = owed_context(state);
+                if owed.is_empty() {
+                    resumed
+                } else {
+                    format!("{resumed} {owed}")
+                }
             }
         }),
+
+        // Paid by the room loop once the resume is sent, so one that fails
+        // leaves the debt for the socket that replaces this one.
+        carries_thinking_debt: can_reply && thinking_owes_context(state),
 
         // Resuming makes Jim speak, so it starts the interjection cooldown like
         // every other reply here. Without this the timing loop could follow the
@@ -818,11 +908,13 @@ fn control_end_interview(
             analysis,
         );
     }
+    let thinking_ended = state.end_thinking(receipt_timestamp_ms);
     state.ended = true;
     state
         .evidence_ledger
         .record_lifecycle(receipt_timestamp_ms, LifecycleTransition::Ended);
     DataEventResult {
+        thinking_changed: thinking_ended.then_some(false),
         finish_interview: Some(
             payload
                 .get("reason")

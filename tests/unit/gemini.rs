@@ -1979,12 +1979,12 @@ fn parse_server_message_extracts_audio_transcripts_and_tool_calls() {
     assert_eq!(
         events,
         vec![
+            GeminiEvent::InputTranscript("candidate".to_string()),
             GeminiEvent::Audio {
                 bytes: vec![0, 1],
                 mime_type: "audio/pcm;rate=24000".to_string(),
             },
             GeminiEvent::Text("text output".to_string()),
-            GeminiEvent::InputTranscript("candidate".to_string()),
             GeminiEvent::OutputTranscript("interviewer".to_string()),
             GeminiEvent::TurnComplete,
             GeminiEvent::Interrupted,
@@ -2600,4 +2600,27 @@ async fn tool_answers_leave_on_the_socket_in_one_frame() {
     assert_eq!(answers[0]["id"], "a");
     assert_eq!(answers[1]["id"], "b");
     session.close().await.unwrap();
+}
+
+#[test]
+fn a_thinking_request_precedes_the_reply_in_the_same_frame() {
+    let parsed = parse_server_message(
+        &json!({
+            "serverContent": {
+                "inputTranscription": {"text": "Let me think for a moment", "finished": true},
+                "modelTurn": {"parts": [{"inlineData": {"data": "AAE=", "mimeType": "audio/pcm"}}]},
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        parsed.events,
+        vec![
+            GeminiEvent::InputTranscript("Let me think for a moment".into()),
+            GeminiEvent::Audio {
+                bytes: vec![0, 1],
+                mime_type: "audio/pcm".into()
+            },
+        ]
+    );
 }

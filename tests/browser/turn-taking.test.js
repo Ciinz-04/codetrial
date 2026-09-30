@@ -6,6 +6,7 @@ import {
   TURN_SPEECH_PEAK,
   TURN_WINDOW_ATTRIBUTE,
   isYieldShortcut,
+  thinkingPayload,
   turnCountdown,
   turnWindowMs,
   yieldTurnPayload,
@@ -24,9 +25,66 @@ function loadInterview(names, scope) {
   )(new Proxy(scope, { has: (target, key) => key in target }));
 }
 
+test("a server thinking acknowledgement updates the controls and records the declared gap", () => {
+  const state = { candidateThinking: false, endsAt: 12345, paused: false };
+  const attributes = {};
+  const nodes = {
+    thinking: {
+      textContent: "Thinking",
+      setAttribute: (key, value) => {
+        attributes[key] = value;
+      },
+    },
+    turnStatus: { textContent: "" },
+  };
+  const events = [];
+  const record = (kind, payload) => events.push({ kind, payload });
+  const { applyThinking: apply } = loadInterview(["applyThinking"], {
+    state,
+    nodes,
+    recordReplay: record,
+  });
+  apply(true);
+  assert.equal(nodes.thinking.textContent, "Continue");
+  assert.equal(attributes["aria-pressed"], "true");
+  assert.match(nodes.turnStatus.textContent, /Speak again/);
+  assert.equal(state.endsAt, 12345);
+  assert.equal(state.paused, false);
+  apply(true);
+  assert.equal(events.length, 1);
+  apply(false);
+  assert.equal(nodes.thinking.textContent, "Thinking");
+  assert.equal(attributes["aria-pressed"], "false");
+  assert.deepEqual(events, [
+    { kind: "lifecycle", payload: { state: "thinking_started" } },
+    { kind: "lifecycle", payload: { state: "thinking_ended" } },
+  ]);
+  assert.deepEqual(thinkingPayload(true), { type: "thinking", thinking: true });
+  assert.deepEqual(yieldTurnPayload(), { type: "yield_turn" });
+});
+
+test("the agent's thinking acknowledgement reaches applyThinking byte for byte", () => {
+  const applied = [];
+  const { receiveControl } = loadInterview(["receiveControl"], {
+    applyThinking: (thinking) => applied.push(thinking),
+    applyPause: () => assert.fail("not a pause"),
+  });
+  // `thinking_state_message` in src/livekit/session.rs asserts these bytes.
+  const encode = (text) => new TextEncoder().encode(text);
+  receiveControl(encode('{"thinking":true,"type":"thinking_state"}'));
+  receiveControl(encode('{"thinking":false,"type":"thinking_state"}'));
+  receiveControl(encode('{"thinking":"yes","type":"thinking_state"}'));
+  assert.deepEqual(applied, [true, false]);
+});
+
 test("the turn controls publish only in a live, connected, unpaused interview", () => {
   const sent = [];
-  const state = { connected: true, paused: false, phase: "live" };
+  const state = {
+    connected: true,
+    paused: false,
+    phase: "live",
+    candidateThinking: false,
+  };
   const scope = {
     state,
     nodes: { editor: {} },
@@ -35,15 +93,23 @@ test("the turn controls publish only in a live, connected, unpaused interview", 
       sent.push([topic, payload]);
       return Promise.resolve();
     },
+    thinkingPayload,
     yieldTurnPayload,
     isYieldShortcut,
   };
-  const { yieldTurn, onTurnKey } = loadInterview(
-    ["canTakeTurnAction", "yieldTurn", "onTurnKey"],
+  const { toggleThinking, yieldTurn, onTurnKey } = loadInterview(
+    ["canTakeTurnAction", "toggleThinking", "yieldTurn", "onTurnKey"],
     scope,
   );
+  toggleThinking();
+  state.candidateThinking = true;
+  toggleThinking();
   yieldTurn();
-  assert.deepEqual(sent, [["control", { type: "yield_turn" }]]);
+  assert.deepEqual(sent, [
+    ["control", { type: "thinking", thinking: true }],
+    ["control", { type: "thinking", thinking: false }],
+    ["control", { type: "yield_turn" }],
+  ]);
 
   let prevented = 0;
   const key = (target) => ({
@@ -56,7 +122,7 @@ test("the turn controls publish only in a live, connected, unpaused interview", 
   });
   onTurnKey(key({ tagName: "DIV" }));
   assert.equal(prevented, 1);
-  assert.equal(sent.length, 2);
+  assert.equal(sent.length, 4);
 
   for (const blocked of [
     () => (state.paused = true),
@@ -65,10 +131,11 @@ test("the turn controls publish only in a live, connected, unpaused interview", 
   ]) {
     Object.assign(state, { connected: true, paused: false, phase: "live" });
     blocked();
+    toggleThinking();
     yieldTurn();
     onTurnKey(key({ tagName: "DIV" }));
   }
-  assert.equal(sent.length, 2, "nothing published outside a live interview");
+  assert.equal(sent.length, 4, "nothing published outside a live interview");
   assert.equal(prevented, 1, "the key is left alone when it does nothing");
 });
 

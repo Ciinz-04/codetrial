@@ -58,6 +58,8 @@ function codeUpdateCases(languages) {
 
 function controlCases() {
   return [
+    { name: "thinking start", payload: lib.thinkingPayload(true) },
+    { name: "thinking end", payload: lib.thinkingPayload(false) },
     { name: "yield turn", payload: lib.yieldTurnPayload() },
     { name: "time warning five minutes", payload: lib.timeWarningPayload(300) },
     { name: "time warning one minute", payload: lib.timeWarningPayload(60) },

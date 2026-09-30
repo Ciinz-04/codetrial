@@ -7,6 +7,7 @@
 //! integration one.
 
 use super::*;
+use crate::agent::ThinkingHold;
 
 // The room half's test module owns the audio fixture, because the room half
 // owns the track it is a stand-in for.
@@ -1027,6 +1028,62 @@ fn oral_test_trace_cannot_end_the_interview_before_execution() {
 }
 
 #[test]
+fn delivering_a_cold_thinking_brief_updates_the_editor_baseline() {
+    let mut state = RuntimeState {
+        needs_cold_brief: true,
+        code: "return 42".into(),
+        code_shown: "return 0".into(),
+        thinking_unheard_reply: true,
+        owed_reply_on_resume: Some("a reply".into()),
+        ..RuntimeState::default()
+    };
+    state.clear_thinking_debt();
+    assert_eq!(state.code_shown, "return 42");
+    assert!(!state.needs_cold_brief);
+    assert!(state.owed_reply_on_resume.is_none());
+    assert!(!state.thinking_unheard_reply);
+}
+
+#[test]
+fn a_spoken_hold_cuts_generation_so_the_next_reply_is_tracked_as_its_own() {
+    let mut activity = RuntimeActivity::new(Instant::now());
+    let (mut output_audio, _frames) = test_output_audio();
+    activity.mark_speaking();
+    activity.note_output();
+    assert!(activity.generating);
+    cut_off_for_hold(&mut activity, &mut output_audio);
+    assert!(!activity.generating);
+    assert!(activity.discarding_output);
+    assert_eq!(activity.floor, Floor::Listening);
+    activity.mark_prompted(Instant::now(), Some("Continue"), false);
+    assert!(!activity.prompt_behind_turn);
+    activity.note_output();
+    assert!(!activity.owes_prompt());
+    activity.generating = true;
+    cut_off_for_hold(&mut activity, &mut output_audio);
+    activity.note_candidate_finished(Instant::now());
+    assert!(activity.awaiting_reply_since.is_some());
+    assert!(activity.owes_reply());
+}
+
+#[test]
+fn output_dropped_by_a_hold_is_disowned_when_the_hold_ends() {
+    let mut state = RuntimeState::default();
+    let mut activity = RuntimeActivity::new(Instant::now());
+    state.paused = true;
+    drop_output(&mut state, &mut activity);
+    assert!(!state.thinking_unheard_reply, "a pause owes nothing here");
+    assert!(!activity.discarding_output);
+    state.paused = false;
+    state.thinking_hold = ThinkingHold::Held {
+        since: std::time::Instant::now(),
+    };
+    drop_output(&mut state, &mut activity);
+    assert!(state.thinking_unheard_reply);
+    assert!(activity.discarding_output);
+}
+
+#[test]
 fn the_turn_window_rides_beside_the_agent_state() {
     let attributes = turn_window_attributes(
         agent_state_attributes(HashMap::new(), AGENT_STATE_LISTENING),
@@ -1047,4 +1104,52 @@ fn the_page_reads_the_turn_window_under_the_same_key() {
         )),
         "web/lib.js must name {TURN_WINDOW_ATTRIBUTE}"
     );
+}
+
+#[test]
+fn the_thinking_state_message_is_the_shape_the_page_parses() {
+    // tests/browser/turn-taking.test.js feeds these same bytes to
+    // `receiveControl`.
+    assert_eq!(
+        thinking_state_message(true).to_string(),
+        r#"{"thinking":true,"type":"thinking_state"}"#
+    );
+    assert_eq!(
+        thinking_state_message(false).to_string(),
+        r#"{"thinking":false,"type":"thinking_state"}"#
+    );
+}
+
+#[test]
+fn a_hold_refuses_hints_and_endings_and_the_refusal_is_counted() {
+    let mut state = RuntimeState {
+        thinking_hold: crate::agent::ThinkingHold::Held {
+            since: std::time::Instant::now(),
+        },
+        hint_ladder: &["first rung"],
+        ..RuntimeState::default()
+    };
+    let call = |name: &str, args: serde_json::Value| GeminiFunctionCall {
+        id: "1".to_string(),
+        name: name.to_string(),
+        args,
+    };
+    for refused in [
+        call(TOOL_LOG_HINT, serde_json::json!({ "requested": true })),
+        call(TOOL_END_INTERVIEW, serde_json::json!({})),
+    ] {
+        assert_eq!(
+            execute_tool_call(&mut state, &refused),
+            serde_json::json!({ "error": REFUSED_DURING_HOLD }),
+            "{}",
+            refused.name
+        );
+    }
+    assert_eq!(state.hint_rungs_given, 0);
+    assert!(!state.end_requested);
+    assert_eq!(state.evidence_ledger.metrics.tool_response_count, 2);
+
+    // Reading the editor is not speaking, so the hold does not refuse it.
+    let read = execute_tool_call(&mut state, &call(TOOL_READ_EDITOR, serde_json::json!({})));
+    assert!(read.get("error").is_none());
 }

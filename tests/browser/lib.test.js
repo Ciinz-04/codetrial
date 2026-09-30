@@ -2959,3 +2959,25 @@ test("more integrity rows than the report holds are trimmed to the cap", () => {
     [...Array(MAX_INTEGRITY_ROWS).keys()],
   );
 });
+
+test("requested thinking time marks response windows until a release or interviewer speech", () => {
+  const avatar = (at, state) => ({ kind: "avatar", at, payload: { state } });
+  const life = (at, state) => ({ kind: "lifecycle", at, payload: { state } });
+  const windows = responseWindows([
+    avatar(0, "speaking"),
+    avatar(1, "listening"),
+    life(2, "thinking_started"),
+    life(3, "paused"),
+    life(4, "thinking_ended"),
+    avatar(5, "speaking"),
+    avatar(6, "listening"),
+    life(7, "resumed"),
+    avatar(8, "speaking"),
+    avatar(9, "listening"),
+    avatar(10, "speaking"),
+  ]);
+  assert.deepEqual(
+    windows.map((window) => window.paused),
+    [true, false, false],
+  );
+});

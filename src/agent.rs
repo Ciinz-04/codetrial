@@ -12,6 +12,12 @@
 //! and `prompts` are the data this file used to hold.
 
 mod events;
+
+mod turn_taking;
+pub use turn_taking::{THINKING_REQUEST_SETTLE, ThinkingHold};
+pub(crate) use turn_taking::{
+    thinking_change, thinking_check_in, thinking_owes_context, thinking_resume, with_thinking_debt,
+};
 mod evidence;
 mod integrity;
 mod problem_guides;
@@ -143,6 +149,16 @@ const ROUND_TRANSITION_SKEW: std::time::Duration = std::time::Duration::from_sec
 /// and the two are held together by
 /// `the_time_warning_threshold_is_the_same_number_on_both_sides`.
 pub const TIME_WARNING_S: u64 = 300;
+
+/// How long a declared thinking hold runs in silence before the interviewer
+/// checks in once. A hold with no end kept every nudge quiet for as long as the
+/// candidate stayed silent, which could be the rest of the interview.
+pub const THINKING_CHECK_IN_S: u64 = 120;
+
+/// A Continue this soon after the last one releases the hold without asking
+/// the interviewer to say anything. Each release is otherwise a generated
+/// turn, and a candidate clicking Thinking on and off would buy one per click.
+pub const THINKING_RELEASE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub const INTERVIEW_CONTRACT_BUNDLE_VERSION: u32 = 22;
 pub const LIVE_PROMPT_VERSION: u32 = 14;
@@ -720,6 +736,18 @@ pub struct RuntimeState {
     /// transcript line. Recovery must include that turn if its text changed.
     pub behavioral_round_prior_turn: Option<(usize, String)>,
     pub paused: bool,
+    /// Thinking keeps media and editor evidence live, but suppresses replies.
+    /// Changed only through the methods in `turn_taking`.
+    pub thinking_hold: ThinkingHold,
+    /// When the Thinking button last ended a hold, so toggling it cannot make
+    /// the interviewer answer every click; see `THINKING_RELEASE_COOLDOWN`.
+    pub thinking_released_at: Option<std::time::Instant>,
+    /// The declared hold state the page has not been told yet; see
+    /// `take_thinking_notice`.
+    pub thinking_notice: Option<bool>,
+    /// A reply the hold dropped is still in the model's history, and the
+    /// release has to say so; see `thinking_resume`.
+    pub thinking_unheard_reply: bool,
     pub framework_evidence: Vec<FrameworkEvidence>,
     /// Deterministic, bounded facts derived from the live session.  The ledger
     /// deliberately holds no editor text or runner diagnostics: those remain
@@ -891,6 +919,10 @@ impl Default for RuntimeState {
             behavioral_round_transcript_start: 0,
             behavioral_round_prior_turn: None,
             paused: false,
+            thinking_hold: ThinkingHold::Off,
+            thinking_released_at: None,
+            thinking_notice: None,
+            thinking_unheard_reply: false,
             framework_evidence: Vec::new(),
             evidence_ledger: EvidenceLedger::default(),
             code: String::new(),
@@ -1904,7 +1936,19 @@ pub struct DataEventResult {
     /// Some only when the pause state genuinely changed, so a browser asking
     /// twice for what it already has publishes nothing.
     pub pause_changed: Option<bool>,
+    pub thinking_changed: Option<bool>,
     pub yield_turn: bool,
+    /// `generate_reply` carries what a hold left owed (see `thinking_resume`),
+    /// so delivering it pays that debt.
+    pub carries_thinking_debt: bool,
+    /// The clock outranks a thinking hold: the reply ends it rather than being
+    /// suppressed by it. Held until the candidate spoke again, the five-minute
+    /// warning reached a candidate thinking in silence only at the deadline,
+    /// and a new round cannot wait on thinking about the last one.
+    pub preempts_hold: bool,
+    /// A reply the thinking hold suppressed, to be given to the model as
+    /// context that asks for no answer.
+    pub held_context: Option<String>,
     /// Agent-owned round transition result: `started` or `skipped`.
     pub round_changed: Option<&'static str>,
     /// How a test result was judged, for the room log; see `TestRunNote`.

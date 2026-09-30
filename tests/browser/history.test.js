@@ -443,7 +443,7 @@ test("the response window panel says what the number is worth, in words a test c
     "duration not recorded",
     "no candidate transcript recorded",
     "transcript not matched to a window",
-    "interview paused during this window",
+    "interview paused or thinking time requested during this window",
   ];
   const words = script.slice(script.indexOf("const WINDOW_WORDS = {"));
   assert.deepEqual(

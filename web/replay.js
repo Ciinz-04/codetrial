@@ -111,7 +111,7 @@ const WINDOW_WORDS = {
   unmatchedTurn: "transcript not matched to a window",
   /// The one cause of a long window the replay can name; why, in
   /// `responseWindows`.
-  paused: "interview paused during this window",
+  paused: "interview paused or thinking time requested during this window",
 };
 
 export function momentTime(at) {

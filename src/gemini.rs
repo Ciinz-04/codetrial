@@ -1613,6 +1613,14 @@ fn parse_server_message(text: &str) -> ServerMessage {
         .filter(|handle| !handle.is_empty())
         .map(str::to_string);
 
+    // A request to keep the floor in this frame must reach the room before any
+    // generated reply sharing it.
+    if let Some(text) = message
+        .pointer("/serverContent/inputTranscription/text")
+        .and_then(Value::as_str)
+    {
+        events.push(GeminiEvent::InputTranscript(text.to_string()));
+    }
     if let Some(parts) = message
         .pointer("/serverContent/modelTurn/parts")
         .and_then(Value::as_array)
@@ -1636,12 +1644,6 @@ fn parse_server_message(text: &str) -> ServerMessage {
                 events.push(GeminiEvent::Text(text.to_string()));
             }
         }
-    }
-    if let Some(text) = message
-        .pointer("/serverContent/inputTranscription/text")
-        .and_then(Value::as_str)
-    {
-        events.push(GeminiEvent::InputTranscript(text.to_string()));
     }
     if let Some(text) = message
         .pointer("/serverContent/outputTranscription/text")

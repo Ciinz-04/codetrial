@@ -407,6 +407,8 @@ pub enum LifecycleTransition {
     Paused,
     Resumed,
     BehavioralStarted,
+    ThinkingStarted,
+    ThinkingEnded,
     Ended,
 }
 
@@ -1078,6 +1080,7 @@ impl EvidenceLedger {
                 self.lifecycle.behavioral_round_started = true
             }
             LifecycleTransition::Ended => self.lifecycle.ended = true,
+            LifecycleTransition::ThinkingStarted | LifecycleTransition::ThinkingEnded => {}
         }
         self.lifecycle.transitions += 1;
         self.append(

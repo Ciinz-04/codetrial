@@ -665,27 +665,60 @@ async fn send_recovery_brief(
     {
         // A reply owed during a pause cannot be asked for yet, since it would
         // be discarded; unpausing asks for it instead of the plain resume line.
-        let reply = owed && !state.paused;
-        if owed && state.paused {
+        let held = state.floor_held();
+        let reply = owed && !held;
+        if owed && held {
             state.owed_reply_on_resume = Some(crate::agent::owed_reply(owed_prompt));
         }
-        let context = crate::agent::with_timer(
-            state,
-            crate::agent::resumed_context(state, reply, owed_prompt),
-        );
+        let mut context = crate::agent::resumed_context(state, reply, owed_prompt);
+
+        // A resumed session keeps what a hold dropped in its history. The reply
+        // asked for here pays whatever the hold left owed, so it carries it,
+        // built by the function whose debt `clear_thinking_debt` clears.
+        if reply {
+            context = crate::agent::with_thinking_debt(state, &context);
+        }
+        let context = crate::agent::with_timer(state, context);
         // The briefing carries the whole editor, so the model has now seen it.
         state.code_shown = state.code.clone();
         send_model_context(gemini, state, ModelInputKind::Turn, &context, reply).await?;
+        if reply {
+            state.clear_thinking_debt();
+        }
         return Ok(reply);
     }
-    if state.paused {
-        state.needs_cold_brief = true;
+    if state.floor_held() {
+        // `hand_over` has already taken the prompt off the activity, so this is
+        // the only place left that knows the old socket owed it. It is asked
+        // for when the pause or hold ends.
+        if let Some(prompt) = owed_prompt {
+            state.owed_reply_on_resume = Some(crate::agent::owed_reply(Some(prompt)));
+        }
+        if state.paused {
+            // Nothing reaches the new socket until the pause ends, so its
+            // briefing can wait for the resume.
+            state.needs_cold_brief = true;
+            return Ok(false);
+        }
+
+        // A hold is not a pause: the candidate's audio still reaches the new
+        // socket, which could answer them knowing nothing of the interview.
+        // Briefed now, as context that asks for no answer.
+        let briefing = crate::agent::with_timer(state, crate::agent::cold_restart(state));
+        state.code_shown = state.code.clone();
+        send_model_context(gemini, state, ModelInputKind::Turn, &briefing, false).await?;
+        // Delivered, so releasing the hold must not brief this socket again.
+        state.needs_cold_brief = false;
         return Ok(false);
     }
-    let briefing = crate::agent::with_timer(state, crate::agent::cold_restart(state));
+    let mut briefing = crate::agent::cold_restart(state);
+    if let Some(prompt) = owed_prompt {
+        briefing.push_str(&format!(" {}", crate::agent::owed_reply(Some(prompt))));
+    }
+    let briefing = crate::agent::with_timer(state, briefing);
     state.code_shown = state.code.clone();
     send_model_text(gemini, state, ModelInputKind::Turn, &briefing).await?;
-    state.needs_cold_brief = false;
+    state.clear_thinking_debt();
     Ok(true)
 }
 
@@ -699,6 +732,12 @@ async fn send_recovery_brief(
 /// not create.
 fn clear_abandoned_socket_work(state: &mut RuntimeState, activity: &mut RuntimeActivity) {
     activity.discarding_output = false;
+
+    // A provisional request waits on its utterance's end, which the closed
+    // socket will not send. A declared hold is the candidate's and survives.
+    state.withdraw_thinking_request();
+    activity.reply_after_thinking_discard = false;
+    activity.thinking_ignore_input_until = None;
     activity.tool_response_outstanding = false;
     state.end_requested = false;
 }
@@ -1129,6 +1168,45 @@ async fn on_watch_tick(
             .interim_review
             .start(spawn_interim_review(context.state, interview));
     }
+    context
+        .activity
+        .settle_stale_request(context.state, tick_at, crate::current_epoch_millis());
+    if context
+        .state
+        .claim_thinking_check_in(tick_at, crate::current_epoch_millis())
+    {
+        let prompt = crate::agent::with_timer(
+            context.state,
+            crate::agent::thinking_check_in(context.state),
+        );
+        match send_model_text(
+            context.gemini,
+            context.state,
+            ModelInputKind::Watch,
+            &prompt,
+        )
+        .await
+        {
+            Ok(()) => context.state.clear_thinking_debt(),
+            Err(error) => {
+                eprintln!("Gemini check-in failed ({error}); waiting for the close to be reported");
+            }
+        }
+        // Owed either way: a replacement socket gives the check-in instead.
+        context
+            .activity
+            .mark_prompted(tick_at, Some(&prompt), false);
+        eprintln!(
+            "{}",
+            prompt_line(
+                context.state,
+                context.activity,
+                "kind=thinking_check_in",
+                interview.boot.room_name,
+            )
+        );
+        return Ok(ControlFlow::Continue(()));
+    }
     if let Some(prompt) = context.activity.watch_prompt(context.state, tick_at) {
         // Not `?`. Every write below is one the reader may be about to explain:
         // a socket Gemini has closed fails the next send long before
@@ -1514,6 +1592,12 @@ pub async fn run_room(
         if step.is_break() {
             return Ok(());
         }
+
+        // Where the page hears about the hold. Every path that starts, ends or
+        // re-announces one leaves its notice on the state, so none of them can
+        // forget to tell the page. An ending flushes its own, since the step
+        // that ends the interview leaves the room before this runs.
+        session::flush_thinking_notice(&room, &mut turn.state).await;
     }
 }
 
@@ -1603,6 +1687,7 @@ async fn handle_room_event(
             if participant.identity().0 == candidate_identity =>
         {
             presence.returned();
+            context.state.announce_thinking();
         }
         _ => {}
     }
@@ -1860,19 +1945,129 @@ pub(super) fn browser_packet(
 /// acknowledgement's `TurnComplete` with the real closing cut off behind it.
 /// `ended`: the report has already gone.
 fn ready_to_close(state: &RuntimeState, activity: &RuntimeActivity) -> bool {
-    state.end_requested && !state.ended && !state.paused && !activity.tool_response_outstanding
+    state.end_requested
+        && !state.ended
+        && !state.floor_held()
+        && !activity.tool_response_outstanding
 }
 
-/// The candidate handed the turn over. Buffered audio goes first, then the
-/// stream ends, so Gemini answers without waiting out its silence window: in a
-/// measured session the reply's first audio came about 0.8s after the last
-/// word rather than 3.4s.
-async fn yield_candidate_turn(
+/// The candidate chose Thinking at `at`. Ending the audio stream makes Gemini
+/// transcribe what came before the click now, inside the window
+/// `ignore_input_before_hold` opens, rather than a silence window later; in a
+/// measured session the transcript followed the stream end by about 0.3s. The
+/// reply Gemini starts for it is dropped by the hold.
+async fn begin_button_hold(
     gemini: &mut GeminiLiveSession,
     candidate_audio: &mut Vec<u8>,
+    activity: &mut RuntimeActivity,
+    at: Instant,
+    grace: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    activity.ignore_input_before_hold(at, grace);
     flush_audio(gemini, candidate_audio).await?;
     gemini.end_audio_turn().await
+}
+
+/// Told to the model when a Thinking click cuts off a reply it was giving.
+const THINKING_CUT_OFF: &str = "[SYSTEM EVENT] The candidate is thinking and has kept the floor. Any reply interrupted by this hold was not heard in full. Stay silent until they speak again or yield the turn.";
+
+/// What a control packet's thinking outcome leaves for the room to do.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HoldEffects {
+    /// Jim was cut off: his turn has to be closed and his state shown as
+    /// listening.
+    cut_off: bool,
+    /// Finalizing the candidate's turn failed and its reply is marked owed,
+    /// so nothing more is sent for this packet.
+    abandoned: bool,
+}
+
+/// The room-free half of a control packet's thinking outcome: the socket
+/// writes and the activity bookkeeping, split from `handle_data_packet` so a
+/// fake socket can drive it. `reply` is the prompt the packet asks for, and
+/// comes back `None` when this has already delivered it as context.
+///
+/// A new hold ends the audio stream and cuts off a reply in progress. Ending
+/// a hold with something to say, or yielding, finalizes the candidate's turn:
+/// buffered audio goes, then the stream ends so Gemini answers without waiting
+/// out its silence window. A candidate turn still open takes the prompt as
+/// context instead, since a realtime prompt would answer before the
+/// candidate's own words.
+async fn settle_hold(
+    context: &mut GeminiEventContext<'_>,
+    result: &crate::agent::DataEventResult,
+    reply: &mut Option<String>,
+    at: Instant,
+    grace: Duration,
+) -> HoldEffects {
+    let mut effects = HoldEffects::default();
+    if result.thinking_changed == Some(true) {
+        if let Err(error) = begin_button_hold(
+            context.gemini,
+            context.candidate_audio,
+            context.activity,
+            at,
+            grace,
+        )
+        .await
+        {
+            eprintln!(
+                "Gemini audio stream end failed ({error}); waiting for the close to be reported"
+            );
+        }
+        if context.activity.floor != Floor::Listening {
+            session::cut_off_for_hold(context.activity, context.output_audio);
+            effects.cut_off = true;
+            if let Err(error) = send_model_context(
+                context.gemini,
+                context.state,
+                ModelInputKind::Turn,
+                THINKING_CUT_OFF,
+                false,
+            )
+            .await
+            {
+                eprintln!(
+                    "Gemini thinking context failed ({error}); waiting for the close to be reported"
+                );
+            }
+        }
+    }
+    let release = result.thinking_changed == Some(false) && reply.is_some();
+    if !(result.yield_turn || release) {
+        return effects;
+    }
+    let finalize_prompt = reply.clone();
+    let finalize = async {
+        flush_audio(context.gemini, context.candidate_audio).await?;
+        if context.turns_candidate_open()
+            && let Some(prompt) = reply.as_deref()
+        {
+            send_model_context(
+                context.gemini,
+                context.state,
+                ModelInputKind::Turn,
+                prompt,
+                false,
+            )
+            .await?;
+            context.activity.defer_thinking_reply(prompt);
+            *reply = None;
+            context.state.clear_thinking_debt();
+        }
+        context.gemini.end_audio_turn().await
+    }
+    .await;
+    if let Err(error) = finalize {
+        eprintln!(
+            "Gemini turn finalization failed ({error}); waiting for the close to be reported"
+        );
+        context
+            .activity
+            .mark_prompted(Instant::now(), finalize_prompt.as_deref(), false);
+        effects.abandoned = true;
+    }
+    effects
 }
 
 /// Ends the interview by handing the loop the packet the browser would send.
@@ -1926,7 +2121,9 @@ async fn handle_data_packet(
 ) -> Result<ControlFlow<()>, Box<dyn std::error::Error + Send + Sync>> {
     // One reading per packet, shared by every entry the packet produces.
     let receipt_timestamp_ms = crate::current_epoch_millis();
-    let result = if received {
+    let packet_at = Instant::now();
+    let was_requested = context.state.thinking_hold.is_requested();
+    let mut result = if received {
         apply_data_event_at(
             context.state,
             topic,
@@ -1952,12 +2149,35 @@ async fn handle_data_packet(
     if result.update_last_interjection {
         context.activity.last_interjection = Instant::now();
     }
-    if result.yield_turn
-        && let Err(error) = yield_candidate_turn(context.gemini, context.candidate_audio).await
-    {
-        eprintln!(
-            "Gemini turn finalization failed ({error}); waiting for the close to be reported"
-        );
+    context
+        .activity
+        .settle_thinking_request(was_requested, context.state, &result);
+    let mut reply = result.generate_reply.take();
+    let grace = thinking_transcript_grace(interview.boot.silence_ms);
+    let effects = settle_hold(context, &result, &mut reply, packet_at, grace).await;
+    if effects.cut_off {
+        close_turns(room, context).await?;
+        set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+    }
+
+    // The reply is already marked owed. Everything else the packet changed
+    // still has to reach the page: a round it started cannot be started again.
+    if effects.abandoned {
+        reply = None;
+    }
+    if let Some(held) = result.held_context.take() {
+        let held = crate::agent::with_timer(context.state, held);
+        if let Err(error) = send_model_context(
+            context.gemini,
+            context.state,
+            ModelInputKind::Turn,
+            &held,
+            false,
+        )
+        .await
+        {
+            eprintln!("Gemini held context failed ({error}); waiting for the close to be reported");
+        }
     }
     if let Some(paused) = result.pause_changed {
         room.local_participant()
@@ -1993,7 +2213,7 @@ async fn handle_data_packet(
             run: context.state.last_test_run.as_ref(),
             note: result.test_run,
             credited_run_is_current: crate::agent::tested_code_is_current(context.state),
-            reacted: result.generate_reply.is_some(),
+            reacted: reply.is_some(),
             ended: context.state.ended,
         };
         eprintln!(
@@ -2002,11 +2222,15 @@ async fn handle_data_packet(
             interview.boot.room_name
         );
     }
-    if let Some(prompt) = result.generate_reply {
+    if let Some(prompt) = reply {
         // Not `?`: a failed write here ended the interview with no report, and
         // the socket it failed on is replaced when the close is reported.
         match send_model_text(context.gemini, context.state, ModelInputKind::Turn, &prompt).await {
             Ok(()) => {
+                if result.carries_thinking_debt {
+                    context.state.clear_thinking_debt();
+                }
+
                 context
                     .activity
                     .mark_prompted(Instant::now(), Some(&prompt), false);
@@ -2026,6 +2250,11 @@ async fn handle_data_packet(
                 );
             }
             Err(error) => {
+                if result.carries_thinking_debt {
+                    context
+                        .activity
+                        .mark_prompted(Instant::now(), Some(&prompt), false);
+                }
                 eprintln!(
                     "Gemini reply request failed ({error}); waiting for the close to be reported"
                 );
@@ -2035,6 +2264,7 @@ async fn handle_data_packet(
     let Some(reason) = result.finish_interview else {
         return Ok(ControlFlow::Continue(()));
     };
+    session::flush_thinking_notice(room, context.state).await;
 
     // The assessment ends here, before the goodbye: the reducer has closed the
     // unasked steps of a round that never opened, and the turns still open are
